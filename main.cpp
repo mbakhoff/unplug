@@ -3,13 +3,16 @@
 #include <fstream>
 #include <string>
 #include <stdexcept>
+#include <vector>
 
 #include <linux/loop.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/mount.h>
 #include <sys/sysmacros.h>
+#include <sched.h>
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -205,6 +208,22 @@ struct spinner_volume {
         return "/dev/" + vg_info.name() + "/" + name;
     }
 
+    void mkfs_ext2() {
+        string dev_path = path();
+        pid_t pid = fork();
+        if (pid == -1)
+            throw runtime_error("fork failed");
+
+        if (pid == 0) {
+            cout << "formatting " << dev_path << endl;
+            execlp("mkfs.ext2", "mkfs.ext2", "-q", dev_path.c_str(), (char*) NULL);
+        }
+
+        int stat;
+        if (waitpid(pid, &stat, 0) != pid || stat != 0)
+            throw runtime_error("mkfs failed " + to_string(errno));
+    }
+
     virtual ~spinner_volume() {
         vg_t vg = lvm_vg_open(vg_info.lh.lvm, vg_info.name().c_str(), "w", 0);
         if (vg) {
@@ -218,20 +237,119 @@ struct spinner_volume {
     }
 };
 
-void mkfs(const string &dev) {
+struct mountpoint {
+
+    vector<string> created_dirs;
+    string from, to;
+
+    mountpoint(const string &from, const string &to, const string &fstype, uint64_t flags = 0) : from(from), to(to) {
+        mkdirs(to, created_dirs);
+        cout << "mounting " + from + " to " + to << endl;
+        if (mount(from.c_str(), to.c_str(), fstype.c_str(), flags, NULL)) {
+            rmdirs(created_dirs);
+            throw runtime_error("mount(" + from + ", " + to + ") failed: " + to_string(errno));
+        }
+    }
+
+    virtual ~mountpoint() {
+        //if (umount2(to.c_str(), MNT_DETACH)) {
+        if (umount(to.c_str())) {
+            cerr << "failed to unmount " << to << endl;
+        } else {
+            rmdirs(created_dirs);
+        }
+    }
+
+    void mkdirs(const string &path, vector<string> &created) {
+        if (path.at(0) != '/')
+            throw runtime_error("mountpoint must be absolute path");
+        try {
+            size_t offset = 1;
+            while (offset < path.length()) {
+                size_t pos = path.find('/', offset);
+                if (pos == string::npos) {
+                    pos = path.length();
+                }
+                string parent = path.substr(0, pos);
+                if (mkdir(parent.c_str(), 0755)) {
+                    if (errno != EEXIST)
+                        throw runtime_error("failed to mkdir " + path);
+                } else {
+                    created.push_back(parent);
+                }
+                offset = pos + 1;
+            }
+
+            struct stat s;
+            if (stat(path.c_str(), &s) || (s.st_mode & S_IFDIR) != S_IFDIR) {
+                throw runtime_error(path + " not a directory");
+            }
+        } catch (runtime_error &e) {
+            rmdirs(created);
+            throw e;
+        }
+    }
+
+    int rmdirs(const vector<string> &dirs) {
+        for (auto it = dirs.rbegin(); it != dirs.rend(); ++it) {
+            const string &dir = *it;
+            if (rmdir(dir.c_str()))
+                return -1;
+        }
+        return 0;
+    }
+};
+
+void run_in_spin() {
     pid_t pid = fork();
     if (pid == -1)
         throw runtime_error("fork failed");
 
     if (pid == 0) {
-        cout << "formatting " << dev << endl;
-        char *path = strdup(dev.c_str());
-        execlp("mkfs.ext2", "-q", path, (char*) NULL);
+        if (setgid(100) || setuid(1000)) { // TODO configure
+            cerr << "failed to drop privileges" << endl;
+            exit(1);
+        }
+        execlp("bash", "bash", (char*) NULL);
+    }
+
+    waitpid(pid, NULL, 0);
+}
+
+void run_child(mountpoint &m) {
+    pid_t pid = fork();
+    if (pid == -1)
+        throw runtime_error("fork failed");
+
+    if (pid == 0) {
+        if (unshare(CLONE_NEWNS | CLONE_NEWNET)) {
+            cerr << "unshare failed" << endl;
+            exit(1);
+        }
+
+        // MS_PRIVATE ensures our overlays don't propagate to the original mount namespace
+        if (mount("none", "/", NULL, MS_REC | MS_PRIVATE, NULL)) {
+            cerr << "failed to mount root private" << endl;
+            exit(1);
+        }
+
+        /* scope for destructors */ {
+            mountpoint vol0_bind(m.to, "/opt", "none", MS_BIND);
+            run_in_spin();
+        }
+        exit(0);
     }
 
     int stat;
-    if (waitpid(pid, &stat, 0) != pid || stat != 0)
-        throw runtime_error("mkfs failed " + to_string(errno));
+    int result = waitpid(pid, &stat, 0);
+    if (result != pid) {
+        throw runtime_error(
+            string("waiting for the child process failed")
+            + " errno=" + to_string(errno)
+            + " stat=" + to_string(stat)
+            + " result=" + to_string(result)
+        );
+    }
 }
 
 int main() {
@@ -244,10 +362,10 @@ int main() {
         volume_group vg(lh, lo);
         spinner_volume vol0(vg, "vol0", 8 * 1024 * 1024);
 
-        mkfs(vol0.path());
+        vol0.mkfs_ext2();
+        mountpoint vol0_public(vol0.path(), "/tmp/spinners/vol0", "ext2");
 
-        cout << "go! " << vol0.path() << endl;
-        sleep(300);
+        run_child(vol0_public);
 
         cout << "success" << endl;
         return 0;
