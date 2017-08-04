@@ -5,7 +5,11 @@
 #include <stdexcept>
 #include <vector>
 
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <linux/veth.h>
 #include <linux/loop.h>
+#include <libmnl/libmnl.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <sys/types.h>
@@ -18,8 +22,12 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <lvm2app.h>
+#include <pwd.h>
 
 using namespace std;
+
+#define dump_error(fn) \
+    printf("%s: %s (%d) #%d\n", fn, strerror(errno), errno, __LINE__);
 
 void on_close_signal(int sig) {
     cout << "caught signal " << sig << endl;
@@ -51,33 +59,33 @@ struct sparse_file {
             home = envhome;
         }
 
-        string dir = home + "/.spinner";
+        string dir = home + "/.unplug";
         if (mkdir(dir.c_str(), 0755)) {
             if (errno != EEXIST) {
                 throw runtime_error("failed to create " + dir);
             }
         }
 
-        char *cpath = (char*) calloc(dir.size() + 32, 1);
-        strcat(cpath, dir.c_str());
-        strcat(cpath, "/store-XXXXXX");
+        path = dir + "/store-" + to_string(getpid());
 
-        fd = mkstemp(cpath);
-        if (fd == -1)
+        fd = open(path.c_str(), O_RDWR | O_CREAT);
+        if (fd == -1) {
+            dump_error("open");
             throw runtime_error("failed to create store (open) " + path);
-
-        path = cpath;
-        free(cpath);
+        }
 
         FILE *file = fdopen(fd, "w");
         if (fseek(file, size - 1, SEEK_SET)) {
+            dump_error("fseek");
             throw runtime_error("failed to create store (seek) " + path);
         }
         char null_byte = 0;
         if (fwrite(&null_byte, 1, 1, file) != 1) {
+            dump_error("fwrite");
             throw runtime_error("failed to create store (write) " + path);
         }
         if (fflush(file)) {
+            dump_error("fflush");
             throw runtime_error("failed to create store (flush) " + path);
         }
     }
@@ -168,7 +176,7 @@ struct volume_group {
     }
 
     string name() {
-        return "spinner" + to_string(lo.id);
+        return "unplug" + to_string(getpid());
     }
 
     virtual ~volume_group() {
@@ -181,13 +189,13 @@ struct volume_group {
     }
 };
 
-struct spinner_volume {
+struct unplug_volume {
 
     volume_group &vg_info;
     string name;
     char *uuid;
 
-    spinner_volume(volume_group &vg_info, const string &name, uint64_t size) : vg_info(vg_info) {
+    unplug_volume(volume_group &vg_info, const string &name, uint64_t size) : vg_info(vg_info) {
         vg_t vg = lvm_vg_open(vg_info.lh.lvm, vg_info.name().c_str(), "w", 0);
         if (vg == NULL)
             throw runtime_error("failed to open volume group " + vg_info.name());        
@@ -224,7 +232,7 @@ struct spinner_volume {
             throw runtime_error("mkfs failed " + to_string(errno));
     }
 
-    virtual ~spinner_volume() {
+    virtual ~unplug_volume() {
         vg_t vg = lvm_vg_open(vg_info.lh.lvm, vg_info.name().c_str(), "w", 0);
         if (vg) {
             lv_t volume = lvm_lv_from_uuid(vg, uuid);
@@ -300,16 +308,160 @@ struct mountpoint {
     }
 };
 
-void run_in_spin() {
+struct veth_pair {
+
+    string host, container;
+
+    veth_pair(pid_t container_pid) {
+        host = "up" + to_string(getpid());
+        container = host + "c";
+
+        char buf[MNL_SOCKET_BUFFER_SIZE];
+        memset(buf, 0, MNL_SOCKET_BUFFER_SIZE);
+
+        nlmsghdr *nlh = mnl_nlmsg_put_header(buf);
+        nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE;
+        nlh->nlmsg_type = RTM_NEWLINK;
+        nlh->nlmsg_seq = time(NULL);
+
+        ifinfomsg *ifm = (ifinfomsg*) mnl_nlmsg_put_extra_header(nlh, sizeof(*ifm));
+        ifm->ifi_family = AF_UNSPEC;
+        ifm->ifi_change = 0;
+        ifm->ifi_flags = 0;
+
+        mnl_attr_put_str(nlh, IFLA_IFNAME, host.c_str());
+
+        nlattr *linkinfo = mnl_attr_nest_start(nlh, IFLA_LINKINFO);
+        mnl_attr_put_str(nlh, IFLA_INFO_KIND, "veth");
+
+        nlattr *data = mnl_attr_nest_start(nlh, IFLA_INFO_DATA);
+        nlattr *veth_peer = mnl_attr_nest_start(nlh, VETH_INFO_PEER);
+
+        ifinfomsg *ifm2 = (ifinfomsg*) mnl_nlmsg_put_extra_header(nlh, sizeof(*ifm2));
+        ifm2->ifi_family = AF_UNSPEC;
+        ifm2->ifi_change = 0;
+        ifm2->ifi_flags = 0;
+
+        mnl_attr_put_str(nlh, IFLA_IFNAME, container.c_str());
+        mnl_attr_put_u32(nlh, IFLA_NET_NS_PID, container_pid);
+
+        mnl_attr_nest_end(nlh, veth_peer);
+        mnl_attr_nest_end(nlh, data);
+        mnl_attr_nest_end(nlh, linkinfo);
+
+        struct mnl_socket *nl = mnl_socket_open(NETLINK_ROUTE);
+        if (nl == NULL) {
+            perror("mnl_socket_open");
+            throw runtime_error("mnl_socket_open");
+        }
+        if (mnl_socket_bind(nl, 0, MNL_SOCKET_AUTOPID) < 0) {
+            perror("mnl_socket_bind");
+            throw runtime_error("mnl_socket_bind");
+        }
+        if (mnl_socket_sendto(nl, nlh, nlh->nlmsg_len) < 0) {
+            perror("mnl_socket_sendto");
+            throw runtime_error("mnl_socket_sendto");
+        }
+
+        char resp_buf[MNL_SOCKET_BUFFER_SIZE];
+        memset(resp_buf, 0, MNL_SOCKET_BUFFER_SIZE);
+
+        ssize_t rx = mnl_socket_recvfrom(nl, resp_buf, sizeof(resp_buf));
+        if (rx == -1) {
+            perror("mnl_socket_recvfrom");
+            throw runtime_error("mnl_socket_recvfrom");
+        }
+
+        mnl_socket_close(nl);
+
+        nlmsghdr *resp = (nlmsghdr*) resp_buf;
+        if (resp->nlmsg_type != NLMSG_ERROR) {
+            throw runtime_error("unexpected response " + to_string(resp->nlmsg_type));
+        }
+        nlmsgerr *resp_msg = (nlmsgerr*) mnl_nlmsg_get_payload(resp);
+        if (resp_msg->error != 0) {
+            throw runtime_error("status " + to_string(resp_msg->error));
+        }
+    }
+
+    virtual ~veth_pair() {
+        char buf[MNL_SOCKET_BUFFER_SIZE];
+        memset(buf, 0, MNL_SOCKET_BUFFER_SIZE);
+
+        nlmsghdr *nlh = mnl_nlmsg_put_header(buf);
+        nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+        nlh->nlmsg_type = RTM_DELLINK;
+        nlh->nlmsg_seq = time(NULL);
+
+        ifinfomsg *ifm = (ifinfomsg*) mnl_nlmsg_put_extra_header(nlh, sizeof(*ifm));
+        ifm->ifi_family = AF_UNSPEC;
+        ifm->ifi_change = 0;
+        ifm->ifi_flags = 0;
+
+        mnl_attr_put_str(nlh, IFLA_IFNAME, host.c_str());
+
+        struct mnl_socket *nl = mnl_socket_open(NETLINK_ROUTE);
+        if (nl == NULL) {
+            perror("mnl_socket_open");
+            return;
+        }
+        if (mnl_socket_bind(nl, 0, MNL_SOCKET_AUTOPID) < 0) {
+            perror("mnl_socket_bind");
+            return;
+        }
+        if (mnl_socket_sendto(nl, nlh, nlh->nlmsg_len) < 0) {
+            perror("mnl_socket_sendto");
+            return;
+        }
+
+        char resp_buf[MNL_SOCKET_BUFFER_SIZE];
+        memset(resp_buf, 0, MNL_SOCKET_BUFFER_SIZE);
+
+        ssize_t rx = mnl_socket_recvfrom(nl, resp_buf, sizeof(resp_buf));
+        if (rx == -1) {
+            perror("mnl_socket_recvfrom");
+            return;
+        }
+
+        mnl_socket_close(nl);
+
+        nlmsghdr *resp = (nlmsghdr*) resp_buf;
+        if (resp->nlmsg_type != NLMSG_ERROR) {
+            cerr << ("unexpected response " + to_string(resp->nlmsg_type)) << endl;
+        }
+        nlmsgerr *resp_msg = (nlmsgerr*) mnl_nlmsg_get_payload(resp);
+        if (resp_msg->error != 0) {
+            cerr << ("status " + to_string(resp_msg->error)) << endl;;
+        }
+    }
+};
+
+int change_user(const string &user) {
+    struct passwd *pw = getpwnam(user.c_str());
+    if (pw == NULL) {
+        perror("user not found");
+        return -1;
+    }
+    gid_t gid = pw->pw_gid;
+    uid_t uid = pw->pw_uid;
+
+    if (setgid(gid) || setuid(uid)) {
+        perror("failed to drop privileges");
+        return -1;
+    }
+
+    return 0;
+}
+
+void run_unplugged() {
     pid_t pid = fork();
     if (pid == -1)
         throw runtime_error("fork failed");
 
     if (pid == 0) {
-        if (setgid(100) || setuid(1000)) { // TODO configure
-            cerr << "failed to drop privileges" << endl;
+        if (change_user("mart")) // TODO configure
             exit(1);
-        }
+
         execlp("bash", "bash", (char*) NULL);
     }
 
@@ -323,22 +475,25 @@ void run_child(mountpoint &m) {
 
     if (pid == 0) {
         if (unshare(CLONE_NEWNS | CLONE_NEWNET)) {
-            cerr << "unshare failed" << endl;
+            perror("unshare failed");
             exit(1);
         }
 
         // MS_PRIVATE ensures our overlays don't propagate to the original mount namespace
         if (mount("none", "/", NULL, MS_REC | MS_PRIVATE, NULL)) {
-            cerr << "failed to mount root private" << endl;
+            perror("failed to mount root private");
             exit(1);
         }
 
         /* scope for destructors */ {
             mountpoint vol0_bind(m.to, "/opt", "none", MS_BIND);
-            run_in_spin();
+            run_unplugged();
         }
         exit(0);
     }
+
+    sleep(1); // TODO sync with pipe
+    veth_pair veth(pid);
 
     int stat;
     int result = waitpid(pid, &stat, 0);
@@ -360,10 +515,10 @@ int main() {
         loopback lo(store);
         lvm_handle lh;
         volume_group vg(lh, lo);
-        spinner_volume vol0(vg, "vol0", 8 * 1024 * 1024);
+        unplug_volume vol0(vg, "vol0", 8 * 1024 * 1024);
 
         vol0.mkfs_ext2();
-        mountpoint vol0_public(vol0.path(), "/tmp/spinners/vol0", "ext2");
+        mountpoint vol0_public(vol0.path(), "/tmp/unplug/vol0", "ext2");
 
         run_child(vol0_public);
 
