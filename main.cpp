@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <grp.h>
 #include <lvm2app.h>
 #include <pwd.h>
 
@@ -44,6 +45,12 @@ void install_signal_handlers() {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 }
+
+struct unplug_config {
+    string runas;
+    vector<string> isolated_dirs;
+    vector<string> argv;
+};
 
 struct sparse_file {
 
@@ -113,7 +120,7 @@ struct loopback {
                 if (errno == EEXIST)
                     continue;
                 throw runtime_error("failed to create loop device " + to_string(errno));
-            }                        
+            }
 
             fd = open(path.c_str(), O_RDWR);
             if (fd == -1) {
@@ -134,10 +141,10 @@ struct loopback {
         }
         if (!created) {
             throw runtime_error("could not find any good loop devices");
-        }        
+        }
     }
 
-    virtual ~loopback() {        
+    virtual ~loopback() {
         ioctl(fd, LOOP_CLR_FD);
         close(fd);
         unlink(path.c_str());
@@ -201,7 +208,7 @@ struct unplug_volume {
     unplug_volume(volume_group &vg_info, const string &name, uint64_t size) : vg_info(vg_info) {
         vg_t vg = lvm_vg_open(vg_info.lh.lvm, vg_info.name().c_str(), "w", 0);
         if (vg == NULL)
-            throw runtime_error("failed to open volume group " + vg_info.name());        
+            throw runtime_error("failed to open volume group " + vg_info.name());
 
         lv_t volume = lvm_vg_create_lv_linear(vg, name.c_str(), size);
         if (volume == NULL) {
@@ -311,21 +318,35 @@ struct mountpoint {
     }
 };
 
-struct veth_pair {
+struct nl_sock_handle {
 
-    string host, container;
+    nl_sock *sk;
 
-    veth_pair(pid_t container_pid) {
-        host = "up" + to_string(getpid());
-        container = host + "c";
-
+    nl_sock_handle() {
         int err;
 
-        nl_sock *sk = nl_socket_alloc();
+        sk = nl_socket_alloc();
         if ((err = nl_connect(sk, NETLINK_ROUTE)) < 0) {
             nl_perror(err, "Unable to connect socket");
             throw runtime_error("nl_connect");
         }
+    }
+
+    virtual ~nl_sock_handle() {
+        nl_close(sk);
+    }
+};
+
+struct veth_pair {
+
+    nl_sock_handle &nl_handle;
+    string host, container;
+    pid_t host_pid;
+
+    veth_pair(nl_sock_handle &nl_handle) : nl_handle(nl_handle) {
+        host = "up" + to_string(getpid());
+        container = host + "c";
+        host_pid = getpid();
 
         rtnl_link *link = rtnl_link_veth_alloc();
         rtnl_link_set_name(link, host.c_str());
@@ -333,66 +354,140 @@ struct veth_pair {
         rtnl_link *peer = rtnl_link_veth_get_peer(link);
         rtnl_link_set_name(peer, container.c_str());
 
-        if ((err = rtnl_link_add(sk, link, NLM_F_CREATE)) < 0) {
+        int err;
+        if ((err = rtnl_link_add(nl_handle.sk, link, NLM_F_CREATE)) < 0) {
                 nl_perror(err, "Unable to add link");
                 throw runtime_error("rtnl_link_add");
         }
 
         rtnl_link_put(link);
         rtnl_link_put(peer);
+    }
+
+    void configure_host() {
+        int err;
+
+        rtnl_link *link;
+        if ((err = rtnl_link_get_kernel(nl_handle.sk, 0, host.c_str(), &link)) < 0) {
+            nl_perror(err, "Unable to refresh link");
+            throw runtime_error("rtnl_link_get_kernel");
+        }
+
+        uint32_t ip_raw = (10) | ((host_pid % UINT16_MAX) << 8) | (1 << 24);
+        nl_addr *ip = nl_addr_build(AF_INET, &ip_raw, sizeof(ip_raw));
+        nl_addr_set_prefixlen(ip, 30);
+
+        rtnl_addr *addr = rtnl_addr_alloc();
+        rtnl_addr_set_family(addr, AF_INET);
+        rtnl_addr_set_link(addr, link);
+        rtnl_addr_set_local(addr, ip);
+
+        if ((err = rtnl_addr_add(nl_handle.sk, addr, 0)) < 0) {
+            nl_perror(err, "Unable to set link ip");
+            throw runtime_error("rtnl_addr_add");
+        }
 
         rtnl_link *req = rtnl_link_alloc();
         rtnl_link_set_flags(req, IFF_UP | IFF_RUNNING);
 
-        if ((err = rtnl_link_get_kernel(sk, 0, host.c_str(), &link)) < 0) {
-            nl_perror(err, "Unable to refresh link");
-            throw runtime_error("rtnl_link_get_kernel");
-        }
-        if ((err = rtnl_link_change(sk, link, req, 0)) < 0) {
+        if ((err = rtnl_link_change(nl_handle.sk, link, req, 0)) < 0) {
             nl_perror(err, "Unable to set link up");
             throw runtime_error("rtnl_link_change");
         }
 
-        if ((err = rtnl_link_get_kernel(sk, 0, container.c_str(), &peer)) < 0) {
+        rtnl_link_put(req);
+        rtnl_link_put(link);
+    }
+
+    void assign_to_container_ns() {
+        int err;
+
+        rtnl_link *peer;
+        // nl_handle is from the original ns -> we can see interfaces from there
+        if ((err = rtnl_link_get_kernel(nl_handle.sk, 0, container.c_str(), &peer)) < 0) {
             nl_perror(err, "Unable to refresh peer");
             throw runtime_error("rtnl_link_get_kernel");
         }
-        if ((err = rtnl_link_change(sk, peer, req, 0)) < 0) {
-            nl_perror(err, "Unable to set peer up");
-            throw runtime_error("rtnl_link_change");
-        }
-        rtnl_link_set_ns_pid(req, container_pid);
-        if ((err = rtnl_link_change(sk, peer, req, 0)) < 0) {
+
+        rtnl_link *req = rtnl_link_alloc();
+        rtnl_link_set_ns_pid(req, getpid());
+
+        if ((err = rtnl_link_change(nl_handle.sk, peer, req, 0)) < 0) {
             nl_perror(err, "Unable to assign peer ns");
             throw runtime_error("rtnl_link_change");
         }
 
         rtnl_link_put(req);
         rtnl_link_put(peer);
-        rtnl_link_put(link);
+    }
 
+    void configure_container() {
+        int err;
+
+        // TODO unhack
+        nl_sock *sk = nl_socket_alloc();
+        if ((err = nl_connect(sk, NETLINK_ROUTE)) < 0) {
+            nl_perror(err, "Unable to connect socket");
+            throw runtime_error("nl_connect");
+        }
+
+        rtnl_link *lo;
+        if ((err = rtnl_link_get_kernel(sk, 0, "lo", &lo)) < 0) {
+            nl_perror(err, "Unable to refresh lo");
+            throw runtime_error("rtnl_link_get_kernel");
+        }
+        rtnl_link *req_lo = rtnl_link_alloc();
+        rtnl_link_set_flags(req_lo, IFF_UP | IFF_RUNNING);
+        if ((err = rtnl_link_change(sk, lo, req_lo, 0)) < 0) {
+            nl_perror(err, "Unable to set lo up");
+            throw runtime_error("rtnl_link_change");
+        }
+        rtnl_link_put(lo);
+
+        rtnl_link *peer;
+        if ((err = rtnl_link_get_kernel(sk, 0, container.c_str(), &peer)) < 0) {
+            nl_perror(err, "Unable to refresh peer");
+            throw runtime_error("rtnl_link_get_kernel");
+        }
+
+        uint32_t ip_raw = (10) | ((host_pid % UINT16_MAX) << 8) | (2 << 24);
+        nl_addr *ip = nl_addr_build(AF_INET, &ip_raw, sizeof(ip_raw));
+        nl_addr_set_prefixlen(ip, 30);
+
+        rtnl_addr *addr = rtnl_addr_alloc();
+        rtnl_addr_set_family(addr, AF_INET);
+        rtnl_addr_set_link(addr, peer);
+        rtnl_addr_set_local(addr, ip);
+
+        if ((err = rtnl_addr_add(sk, addr, 0)) < 0) {
+            nl_perror(err, "Unable to set peer ip");
+            throw runtime_error("rtnl_addr_add");
+        }
+
+        rtnl_link *req = rtnl_link_alloc();
+        rtnl_link_set_flags(req, IFF_UP | IFF_RUNNING);
+
+        if ((err = rtnl_link_change(sk, peer, req, 0)) < 0) {
+            nl_perror(err, "Unable to set peer up");
+            throw runtime_error("rtnl_link_change");
+        }
+
+        rtnl_link_put(req);
+        rtnl_link_put(peer);
         nl_close(sk);
     }
 
     virtual ~veth_pair() {
-        int err;
-
-        nl_sock *sk = nl_socket_alloc();
-        if ((err = nl_connect(sk, NETLINK_ROUTE)) < 0) {
-            nl_perror(err, "Unable to connect socket");
-            return;
-        }
-
         rtnl_link *link = rtnl_link_alloc();
         rtnl_link_set_name(link, host.c_str());
 
-        if ((err = rtnl_link_delete(sk, link)) < 0) {
+        int err;
+        if ((err = rtnl_link_delete(nl_handle.sk, link)) < 0) {
             nl_perror(err, "Unable to delete link");
             return;
         }
 
         rtnl_link_put(link);
-        nl_close(sk);
     }
 };
 
@@ -405,6 +500,17 @@ int change_user(const string &user) {
     gid_t gid = pw->pw_gid;
     uid_t uid = pw->pw_uid;
 
+    int ngroups = 1024;
+    gid_t group_ids[ngroups];
+    if (getgrouplist(user.c_str(), gid, group_ids, &ngroups) == -1) {
+        perror("too many complementary groups");
+        return -1;
+    }
+    if (setgroups(ngroups, group_ids)) {
+        perror("failed to assign complementary groups");
+        return -1;
+    }
+
     if (setgid(gid) || setuid(uid)) {
         perror("failed to drop privileges");
         return -1;
@@ -413,61 +519,85 @@ int change_user(const string &user) {
     return 0;
 }
 
-void run_unplugged() {
+void run_unplugged(unplug_config &cfg) {
     pid_t pid = fork();
     if (pid == -1)
-        throw runtime_error("fork failed");
+        throw runtime_error("fork failed (unplugged)");
 
     if (pid == 0) {
-        if (change_user("mart")) // TODO configure
+        if (change_user(cfg.runas))
             exit(1);
 
-        execlp("bash", "bash", (char*) NULL);
+        int argc = cfg.argv.size();
+        char *cmd[argc + 1];
+        for (int i = 0; i < argc; i++) {
+            cmd[i] = strdup(cfg.argv[i].c_str());
+        }
+        cmd[argc] = NULL;
+
+        execvp(cmd[0], cmd);
     }
 
     waitpid(pid, NULL, 0);
 }
 
-void run_child(mountpoint &m) {
+void run_child(unplug_config &cfg, mountpoint &m) {
+
+    nl_sock_handle nl_handle;
+    veth_pair veth(nl_handle);
+    veth.configure_host();
+
     pid_t pid = fork();
     if (pid == -1)
         throw runtime_error("fork failed");
 
     if (pid == 0) {
-        if (unshare(CLONE_NEWNS | CLONE_NEWNET)) {
-            perror("unshare failed");
+        try {
+            if (unshare(CLONE_NEWNS | CLONE_NEWNET)) {
+                perror("unshare failed");
+                exit(1);
+            }
+
+            veth.assign_to_container_ns();
+            veth.configure_container();
+
+            // MS_PRIVATE ensures our overlays don't propagate to the original mount namespace
+            if (mount("none", "/", NULL, MS_REC | MS_PRIVATE, NULL)) {
+                perror("failed to mount root private");
+                exit(1);
+            }
+
+            /* scope for destructors */ {
+                mountpoint vol0_bind(m.to, "/opt", "none", MS_BIND);
+                run_unplugged(cfg);
+            }
+
+            exit(0);
+        } catch (exception &e) {
+            cerr << "exception in fork: " << e.what() << endl;
             exit(1);
         }
-
-        // MS_PRIVATE ensures our overlays don't propagate to the original mount namespace
-        if (mount("none", "/", NULL, MS_REC | MS_PRIVATE, NULL)) {
-            perror("failed to mount root private");
-            exit(1);
-        }
-
-        /* scope for destructors */ {
-            mountpoint vol0_bind(m.to, "/opt", "none", MS_BIND);
-            run_unplugged();
-        }
-        exit(0);
     }
 
-    sleep(1); // TODO sync with pipe
-    veth_pair veth(pid);
-
-    int stat;
-    int result = waitpid(pid, &stat, 0);
+    int result = waitpid(pid, NULL, 0);
     if (result != pid) {
-        throw runtime_error(
-            string("waiting for the child process failed")
-            + " errno=" + to_string(errno)
-            + " stat=" + to_string(stat)
-            + " result=" + to_string(result)
-        );
+        perror("waiting for child");
+        throw runtime_error("waitpid");
     }
 }
 
-int main() {
+int main(int argc, char **argv) {
+    unplug_config cfg;
+    cfg.runas = "mart";
+    cfg.isolated_dirs.push_back("/opt");
+    for (int i = 1; i < argc; i++) {
+        cfg.argv.push_back(argv[i]);
+    }
+    if (cfg.argv.empty()) {
+        cerr << "no command" << endl;
+        exit(1);
+    }
+
     install_signal_handlers();
 
     try {
@@ -480,7 +610,7 @@ int main() {
         vol0.mkfs_ext2();
         mountpoint vol0_public(vol0.path(), "/tmp/unplug/vol0", "ext2");
 
-        run_child(vol0_public);
+        run_child(cfg, vol0_public);
 
         cout << "success" << endl;
         return 0;
