@@ -5,11 +5,14 @@
 #include <stdexcept>
 #include <vector>
 
+#include <netlink/netlink.h>
+#include <netlink/route/addr.h>
+#include <netlink/route/link.h>
+#include <netlink/route/link/veth.h>
+
+#include <linux/if.h>
 #include <linux/netlink.h>
-#include <linux/rtnetlink.h>
-#include <linux/veth.h>
 #include <linux/loop.h>
-#include <libmnl/libmnl.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <sys/types.h>
@@ -316,123 +319,80 @@ struct veth_pair {
         host = "up" + to_string(getpid());
         container = host + "c";
 
-        char buf[MNL_SOCKET_BUFFER_SIZE];
-        memset(buf, 0, MNL_SOCKET_BUFFER_SIZE);
+        int err;
 
-        nlmsghdr *nlh = mnl_nlmsg_put_header(buf);
-        nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE;
-        nlh->nlmsg_type = RTM_NEWLINK;
-        nlh->nlmsg_seq = time(NULL);
-
-        ifinfomsg *ifm = (ifinfomsg*) mnl_nlmsg_put_extra_header(nlh, sizeof(*ifm));
-        ifm->ifi_family = AF_UNSPEC;
-        ifm->ifi_change = 0;
-        ifm->ifi_flags = 0;
-
-        mnl_attr_put_str(nlh, IFLA_IFNAME, host.c_str());
-
-        nlattr *linkinfo = mnl_attr_nest_start(nlh, IFLA_LINKINFO);
-        mnl_attr_put_str(nlh, IFLA_INFO_KIND, "veth");
-
-        nlattr *data = mnl_attr_nest_start(nlh, IFLA_INFO_DATA);
-        nlattr *veth_peer = mnl_attr_nest_start(nlh, VETH_INFO_PEER);
-
-        ifinfomsg *ifm2 = (ifinfomsg*) mnl_nlmsg_put_extra_header(nlh, sizeof(*ifm2));
-        ifm2->ifi_family = AF_UNSPEC;
-        ifm2->ifi_change = 0;
-        ifm2->ifi_flags = 0;
-
-        mnl_attr_put_str(nlh, IFLA_IFNAME, container.c_str());
-        mnl_attr_put_u32(nlh, IFLA_NET_NS_PID, container_pid);
-
-        mnl_attr_nest_end(nlh, veth_peer);
-        mnl_attr_nest_end(nlh, data);
-        mnl_attr_nest_end(nlh, linkinfo);
-
-        struct mnl_socket *nl = mnl_socket_open(NETLINK_ROUTE);
-        if (nl == NULL) {
-            perror("mnl_socket_open");
-            throw runtime_error("mnl_socket_open");
-        }
-        if (mnl_socket_bind(nl, 0, MNL_SOCKET_AUTOPID) < 0) {
-            perror("mnl_socket_bind");
-            throw runtime_error("mnl_socket_bind");
-        }
-        if (mnl_socket_sendto(nl, nlh, nlh->nlmsg_len) < 0) {
-            perror("mnl_socket_sendto");
-            throw runtime_error("mnl_socket_sendto");
+        nl_sock *sk = nl_socket_alloc();
+        if ((err = nl_connect(sk, NETLINK_ROUTE)) < 0) {
+            nl_perror(err, "Unable to connect socket");
+            throw runtime_error("nl_connect");
         }
 
-        char resp_buf[MNL_SOCKET_BUFFER_SIZE];
-        memset(resp_buf, 0, MNL_SOCKET_BUFFER_SIZE);
+        rtnl_link *link = rtnl_link_veth_alloc();
+        rtnl_link_set_name(link, host.c_str());
 
-        ssize_t rx = mnl_socket_recvfrom(nl, resp_buf, sizeof(resp_buf));
-        if (rx == -1) {
-            perror("mnl_socket_recvfrom");
-            throw runtime_error("mnl_socket_recvfrom");
+        rtnl_link *peer = rtnl_link_veth_get_peer(link);
+        rtnl_link_set_name(peer, container.c_str());
+
+        if ((err = rtnl_link_add(sk, link, NLM_F_CREATE)) < 0) {
+                nl_perror(err, "Unable to add link");
+                throw runtime_error("rtnl_link_add");
         }
 
-        mnl_socket_close(nl);
+        rtnl_link_put(link);
+        rtnl_link_put(peer);
 
-        nlmsghdr *resp = (nlmsghdr*) resp_buf;
-        if (resp->nlmsg_type != NLMSG_ERROR) {
-            throw runtime_error("unexpected response " + to_string(resp->nlmsg_type));
+        rtnl_link *req = rtnl_link_alloc();
+        rtnl_link_set_flags(req, IFF_UP | IFF_RUNNING);
+
+        if ((err = rtnl_link_get_kernel(sk, 0, host.c_str(), &link)) < 0) {
+            nl_perror(err, "Unable to refresh link");
+            throw runtime_error("rtnl_link_get_kernel");
         }
-        nlmsgerr *resp_msg = (nlmsgerr*) mnl_nlmsg_get_payload(resp);
-        if (resp_msg->error != 0) {
-            throw runtime_error("status " + to_string(resp_msg->error));
+        if ((err = rtnl_link_change(sk, link, req, 0)) < 0) {
+            nl_perror(err, "Unable to set link up");
+            throw runtime_error("rtnl_link_change");
         }
+
+        if ((err = rtnl_link_get_kernel(sk, 0, container.c_str(), &peer)) < 0) {
+            nl_perror(err, "Unable to refresh peer");
+            throw runtime_error("rtnl_link_get_kernel");
+        }
+        if ((err = rtnl_link_change(sk, peer, req, 0)) < 0) {
+            nl_perror(err, "Unable to set peer up");
+            throw runtime_error("rtnl_link_change");
+        }
+        rtnl_link_set_ns_pid(req, container_pid);
+        if ((err = rtnl_link_change(sk, peer, req, 0)) < 0) {
+            nl_perror(err, "Unable to assign peer ns");
+            throw runtime_error("rtnl_link_change");
+        }
+
+        rtnl_link_put(req);
+        rtnl_link_put(peer);
+        rtnl_link_put(link);
+
+        nl_close(sk);
     }
 
     virtual ~veth_pair() {
-        char buf[MNL_SOCKET_BUFFER_SIZE];
-        memset(buf, 0, MNL_SOCKET_BUFFER_SIZE);
+        int err;
 
-        nlmsghdr *nlh = mnl_nlmsg_put_header(buf);
-        nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
-        nlh->nlmsg_type = RTM_DELLINK;
-        nlh->nlmsg_seq = time(NULL);
-
-        ifinfomsg *ifm = (ifinfomsg*) mnl_nlmsg_put_extra_header(nlh, sizeof(*ifm));
-        ifm->ifi_family = AF_UNSPEC;
-        ifm->ifi_change = 0;
-        ifm->ifi_flags = 0;
-
-        mnl_attr_put_str(nlh, IFLA_IFNAME, host.c_str());
-
-        struct mnl_socket *nl = mnl_socket_open(NETLINK_ROUTE);
-        if (nl == NULL) {
-            perror("mnl_socket_open");
-            return;
-        }
-        if (mnl_socket_bind(nl, 0, MNL_SOCKET_AUTOPID) < 0) {
-            perror("mnl_socket_bind");
-            return;
-        }
-        if (mnl_socket_sendto(nl, nlh, nlh->nlmsg_len) < 0) {
-            perror("mnl_socket_sendto");
+        nl_sock *sk = nl_socket_alloc();
+        if ((err = nl_connect(sk, NETLINK_ROUTE)) < 0) {
+            nl_perror(err, "Unable to connect socket");
             return;
         }
 
-        char resp_buf[MNL_SOCKET_BUFFER_SIZE];
-        memset(resp_buf, 0, MNL_SOCKET_BUFFER_SIZE);
+        rtnl_link *link = rtnl_link_alloc();
+        rtnl_link_set_name(link, host.c_str());
 
-        ssize_t rx = mnl_socket_recvfrom(nl, resp_buf, sizeof(resp_buf));
-        if (rx == -1) {
-            perror("mnl_socket_recvfrom");
+        if ((err = rtnl_link_delete(sk, link)) < 0) {
+            nl_perror(err, "Unable to delete link");
             return;
         }
 
-        mnl_socket_close(nl);
-
-        nlmsghdr *resp = (nlmsghdr*) resp_buf;
-        if (resp->nlmsg_type != NLMSG_ERROR) {
-            cerr << ("unexpected response " + to_string(resp->nlmsg_type)) << endl;
-        }
-        nlmsgerr *resp_msg = (nlmsgerr*) mnl_nlmsg_get_payload(resp);
-        if (resp_msg->error != 0) {
-            cerr << ("status " + to_string(resp_msg->error)) << endl;;
-        }
+        rtnl_link_put(link);
+        nl_close(sk);
     }
 };
 
