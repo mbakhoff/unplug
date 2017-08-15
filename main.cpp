@@ -7,9 +7,11 @@
 
 #include <netlink/netlink.h>
 #include <netlink/route/addr.h>
+#include <netlink/route/rule.h>
 #include <netlink/route/link.h>
 #include <netlink/route/link/veth.h>
 
+#include <arpa/inet.h>
 #include <linux/if.h>
 #include <linux/netlink.h>
 #include <linux/loop.h>
@@ -28,13 +30,17 @@
 #include <lvm2app.h>
 #include <pwd.h>
 
-using namespace std;
+using std::string;
+using std::vector;
+using std::exception;
+using std::runtime_error;
+using std::to_string;
 
 #define dump_error(fn) \
     printf("%s: %s (%d) #%d\n", fn, strerror(errno), errno, __LINE__);
 
 void on_close_signal(int sig) {
-    cout << "caught signal " << sig << endl;
+    printf("caught signal %d\n", sig);
 }
 
 void install_signal_handlers() {
@@ -44,6 +50,16 @@ void install_signal_handlers() {
     sigfillset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+}
+
+void enable_ip_forward() {
+    FILE *ip_forward = fopen("/proc/sys/net/ipv4/ip_forward", "w");
+    if (ip_forward == NULL)
+        throw runtime_error("ip_forward");
+    char enable = '1';
+    int w = fwrite(&enable, 1, 1, ip_forward);
+    if (fclose(ip_forward) || w != 1)
+        throw runtime_error("ip_forward");
 }
 
 struct unplug_config {
@@ -125,13 +141,15 @@ struct loopback {
             fd = open(path.c_str(), O_RDWR);
             if (fd == -1) {
                 unlink(path.c_str());
-                cerr << "failed to open loop " << path << " " << to_string(errno) << endl;
+                printf("trying %s\n", path.c_str());
+                dump_error("loopback");
                 continue;
             }
             if (ioctl(fd, LOOP_SET_FD, store.fd)) {
                 close(fd);
                 unlink(path.c_str());
-                cerr << "failed to attach loop " << path << " " << to_string(errno) << endl;
+                printf("trying %s\n", path.c_str());
+                dump_error("loopback");
                 continue;
             }
 
@@ -233,7 +251,7 @@ struct unplug_volume {
             throw runtime_error("fork failed");
 
         if (pid == 0) {
-            cout << "formatting " << dev_path << endl;
+            printf("formatting %s\n", dev_path.c_str());
             execlp("mkfs.ext2", "mkfs.ext2", "-q", dev_path.c_str(), (char*) NULL);
         }
 
@@ -262,7 +280,7 @@ struct mountpoint {
 
     mountpoint(const string &from, const string &to, const string &fstype, uint64_t flags = 0) : from(from), to(to) {
         mkdirs(to, created_dirs);
-        cout << "mounting " + from + " to " + to << endl;
+        printf("mounting %s to %s\n", from.c_str(), to.c_str());
         if (mount(from.c_str(), to.c_str(), fstype.c_str(), flags, NULL)) {
             rmdirs(created_dirs);
             throw runtime_error("mount(" + from + ", " + to + ") failed: " + to_string(errno));
@@ -272,7 +290,7 @@ struct mountpoint {
     virtual ~mountpoint() {
         //if (umount2(to.c_str(), MNT_DETACH)) {
         if (umount(to.c_str())) {
-            cerr << "failed to unmount " << to << endl;
+            printf("failed to unmount %s\n", to.c_str());
         } else {
             rmdirs(created_dirs);
         }
@@ -364,6 +382,12 @@ struct veth_pair {
         rtnl_link_put(peer);
     }
 
+    string subnet_addr() {
+        in_addr addr;
+        addr.s_addr = (10) | ((host_pid % UINT16_MAX) << 8);
+        return inet_ntoa(addr);
+    }
+
     void configure_host() {
         int err;
 
@@ -395,6 +419,10 @@ struct veth_pair {
             throw runtime_error("rtnl_link_change");
         }
 
+        string nat_command = "iptables -t nat -A POSTROUTING -s " + subnet_addr() + "/30 -j MASQUERADE";
+        if (system(nat_command.c_str()))
+            throw runtime_error("MASQUERADE");
+
         rtnl_link_put(req);
         rtnl_link_put(link);
     }
@@ -419,6 +447,32 @@ struct veth_pair {
 
         rtnl_link_put(req);
         rtnl_link_put(peer);
+    }
+
+    void add_gateway(nl_sock *sk) {
+        int err;
+
+        uint32_t gw_raw = (10) | ((host_pid % UINT16_MAX) << 8) | (1 << 24);
+        nl_addr *gw_ip = nl_addr_build(AF_INET, &gw_raw, sizeof(gw_raw));
+
+        nl_addr *gw_target;
+        nl_addr_parse("0.0.0.0/0", AF_INET, &gw_target);
+
+        rtnl_route *route_gw = rtnl_route_alloc();
+        rtnl_route_set_dst(route_gw, gw_target);
+
+        rtnl_nexthop *nh = rtnl_route_nh_alloc();
+        rtnl_route_nh_set_gateway(nh, gw_ip);
+        rtnl_route_add_nexthop(route_gw, nh);
+
+        if ((err = rtnl_route_add(sk, route_gw, NLM_F_CREATE)) < 0) {
+            nl_perror(err, "Unable to add default gateway");
+            throw runtime_error("rtnl_route_add");
+        }
+
+        rtnl_route_put(route_gw);
+        nl_addr_put(gw_ip);
+        nl_addr_put(gw_target);
     }
 
     void configure_container() {
@@ -472,12 +526,17 @@ struct veth_pair {
             throw runtime_error("rtnl_link_change");
         }
 
+        add_gateway(sk);
+
         rtnl_link_put(req);
         rtnl_link_put(peer);
         nl_close(sk);
     }
 
     virtual ~veth_pair() {
+        string nat_cleanup = "iptables -t nat -D POSTROUTING -s " + subnet_addr() + "/30 -j MASQUERADE";
+        system(nat_cleanup.c_str());
+
         rtnl_link *link = rtnl_link_alloc();
         rtnl_link_set_name(link, host.c_str());
 
@@ -574,7 +633,7 @@ void run_child(unplug_config &cfg, mountpoint &m) {
 
             exit(0);
         } catch (exception &e) {
-            cerr << "exception in fork: " << e.what() << endl;
+            printf("exception in fork: %s\n", e.what());
             exit(1);
         }
     }
@@ -594,11 +653,12 @@ int main(int argc, char **argv) {
         cfg.argv.push_back(argv[i]);
     }
     if (cfg.argv.empty()) {
-        cerr << "no command" << endl;
+        printf("no command\n");
         exit(1);
     }
 
     install_signal_handlers();
+    enable_ip_forward();
 
     try {
         sparse_file store(32 * 1024 * 1024);
@@ -612,10 +672,10 @@ int main(int argc, char **argv) {
 
         run_child(cfg, vol0_public);
 
-        cout << "success" << endl;
+        printf("success\n");
         return 0;
     } catch (const exception &e) {
-        cout << "error: " << e.what() << endl;
+        printf("error: %s\n", e.what());
         return 1;
     }
 }
