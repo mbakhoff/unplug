@@ -4,6 +4,7 @@
 #include <string>
 #include <stdexcept>
 #include <vector>
+#include <memory>
 
 #include <netlink/netlink.h>
 #include <netlink/route/addr.h>
@@ -27,7 +28,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <grp.h>
-#include <lvm2app.h>
 #include <pwd.h>
 
 using std::string;
@@ -62,6 +62,26 @@ void enable_ip_forward() {
         throw runtime_error("ip_forward");
 }
 
+void mkfs_ext2(string path) {
+    struct stat s;
+    if (stat(path.c_str(), &s) || (s.st_mode & S_IFREG) != S_IFREG) {
+        throw runtime_error(path + " not a file");
+    }
+
+    pid_t pid = fork();
+    if (pid == -1)
+        throw runtime_error("fork failed");
+
+    if (pid == 0) {
+        printf("formatting %s\n", path.c_str());
+        execlp("mkfs.ext2", "mkfs.ext2", "-q", path.c_str(), (char*) NULL);
+    }
+
+    int stat;
+    if (waitpid(pid, &stat, 0) != pid || stat != 0)
+        throw runtime_error("mkfs failed " + to_string(errno));
+}
+
 struct unplug_config {
     string runas;
     vector<string> isolated_dirs;
@@ -94,7 +114,7 @@ struct sparse_file {
 
         path = dir + "/store-" + to_string(getpid());
 
-        fd = open(path.c_str(), O_RDWR | O_CREAT);
+        fd = open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
         if (fd == -1) {
             dump_error("open");
             throw runtime_error("failed to create store (open) " + path);
@@ -115,6 +135,8 @@ struct sparse_file {
             throw runtime_error("failed to create store (flush) " + path);
         }
     }
+
+    sparse_file(const sparse_file &src) = delete;
 
     virtual ~sparse_file() {
         close(fd);
@@ -162,114 +184,12 @@ struct loopback {
         }
     }
 
+    loopback(const loopback &src) = delete;
+
     virtual ~loopback() {
         ioctl(fd, LOOP_CLR_FD);
         close(fd);
         unlink(path.c_str());
-    }
-};
-
-struct lvm_handle {
-
-    lvm_t lvm;
-
-    lvm_handle() {
-        lvm = lvm_init(NULL);
-        if (lvm == NULL)
-            throw runtime_error("failed to init lvm");
-    }
-
-    virtual ~lvm_handle() {
-        lvm_quit(lvm);
-    }
-};
-
-struct volume_group {
-
-    lvm_handle &lh;
-    loopback &lo;
-
-    volume_group(lvm_handle &lh, loopback &lo) : lh(lh), lo(lo) {
-        vg_t vg = lvm_vg_create(lh.lvm, name().c_str());
-        if (vg == NULL) {
-            throw runtime_error("failed to vg_create");
-        }
-        if (lvm_vg_extend(vg, lo.path.c_str())) {
-            throw runtime_error("failed to vg_extend");
-        }
-        if (lvm_vg_write(vg)) {
-            throw runtime_error("failed to vg_write");
-        }
-        lvm_vg_close(vg);
-    }
-
-    string name() {
-        return "unplug" + to_string(getpid());
-    }
-
-    virtual ~volume_group() {
-        vg_t vg = lvm_vg_open(lh.lvm, name().c_str(), "w", 0);
-        if (vg != NULL) {
-            lvm_vg_remove(vg);
-            lvm_vg_write(vg);
-            lvm_vg_close(vg);
-        }
-    }
-};
-
-struct unplug_volume {
-
-    volume_group &vg_info;
-    string name;
-    char *uuid;
-
-    unplug_volume(volume_group &vg_info, const string &name, uint64_t size) : vg_info(vg_info) {
-        vg_t vg = lvm_vg_open(vg_info.lh.lvm, vg_info.name().c_str(), "w", 0);
-        if (vg == NULL)
-            throw runtime_error("failed to open volume group " + vg_info.name());
-
-        lv_t volume = lvm_vg_create_lv_linear(vg, name.c_str(), size);
-        if (volume == NULL) {
-            lvm_vg_close(vg);
-            throw runtime_error("failed to allocate volume " + name);
-        }
-        uuid = strdup(lvm_lv_get_uuid(volume));
-        if (lvm_vg_close(vg))
-            throw runtime_error("failed to close volume group " + vg_info.name());
-
-        this->name = name;
-    }
-
-    string path() {
-        return "/dev/" + vg_info.name() + "/" + name;
-    }
-
-    void mkfs_ext2() {
-        string dev_path = path();
-        pid_t pid = fork();
-        if (pid == -1)
-            throw runtime_error("fork failed");
-
-        if (pid == 0) {
-            printf("formatting %s\n", dev_path.c_str());
-            execlp("mkfs.ext2", "mkfs.ext2", "-q", dev_path.c_str(), (char*) NULL);
-        }
-
-        int stat;
-        if (waitpid(pid, &stat, 0) != pid || stat != 0)
-            throw runtime_error("mkfs failed " + to_string(errno));
-    }
-
-    virtual ~unplug_volume() {
-        vg_t vg = lvm_vg_open(vg_info.lh.lvm, vg_info.name().c_str(), "w", 0);
-        if (vg) {
-            lv_t volume = lvm_lv_from_uuid(vg, uuid);
-            if (volume) {
-                lvm_vg_remove_lv(volume);
-            }
-            lvm_vg_close(vg);
-        }
-        free(uuid);
     }
 };
 
@@ -286,6 +206,8 @@ struct mountpoint {
             throw runtime_error("mount(" + from + ", " + to + ") failed: " + to_string(errno));
         }
     }
+
+    mountpoint(const mountpoint &src) = delete;
 
     virtual ~mountpoint() {
         //if (umount2(to.c_str(), MNT_DETACH)) {
@@ -381,6 +303,8 @@ struct veth_pair {
         rtnl_link_put(link);
         rtnl_link_put(peer);
     }
+
+    veth_pair(const veth_pair &src) = delete;
 
     string subnet_addr() {
         in_addr addr;
@@ -600,17 +524,21 @@ void run_unplugged(unplug_config &cfg) {
     waitpid(pid, NULL, 0);
 }
 
-void run_child(unplug_config &cfg, mountpoint &m) {
+void run_child(unplug_config &cfg, mountpoint &layer) {
 
     nl_sock_handle nl_handle;
     veth_pair veth(nl_handle);
     veth.configure_host();
 
+    pid_t parent = getpid();
     pid_t pid = fork();
     if (pid == -1)
         throw runtime_error("fork failed");
 
     if (pid == 0) {
+        string pid_str = to_string(parent);
+        setenv("UNPLUG_PID", pid_str.c_str(), 1);
+
         try {
             if (unshare(CLONE_NEWNS | CLONE_NEWNET)) {
                 perror("unshare failed");
@@ -627,7 +555,11 @@ void run_child(unplug_config &cfg, mountpoint &m) {
             }
 
             /* scope for destructors */ {
-                mountpoint vol0_bind(m.to, "/opt", "none", MS_BIND);
+                vector<std::unique_ptr<mountpoint>> binds;
+                for (string isolated : cfg.isolated_dirs) {
+                    string layer_dir = layer.to + isolated;
+                    binds.push_back(std::unique_ptr<mountpoint>(new mountpoint(layer_dir, isolated, "none", MS_BIND)));
+                }
                 run_unplugged(cfg);
             }
 
@@ -645,10 +577,31 @@ void run_child(unplug_config &cfg, mountpoint &m) {
     }
 }
 
+void clone_isolated(mountpoint &layer, vector<string> &sources) {
+    for (string &source : sources) {
+        if (source.empty() || source.at(0) != '/') {
+            throw runtime_error("isolated paths must be absolute");
+        }
+        string target = layer.to + source;
+        string target_parent = target.substr(0, target.find_last_of("/"));
+
+        printf("cloning %s -> %s\n", source.c_str(), layer.to.c_str());
+
+        string mkdir_cmd = "mkdir -p '" + target_parent + "'";
+        if (system(mkdir_cmd.c_str()))
+            throw runtime_error(mkdir_cmd);
+
+        string cp_cmd = "cp -a '" + source + "' '" + target_parent + "'";
+        if (system(cp_cmd.c_str()))
+            throw runtime_error(cp_cmd);
+    }
+}
+
 int main(int argc, char **argv) {
     unplug_config cfg;
     cfg.runas = "mart";
-    cfg.isolated_dirs.push_back("/opt");
+    cfg.isolated_dirs.push_back("/tmp/potato1");
+    cfg.isolated_dirs.push_back("/tmp/potato2");
     for (int i = 1; i < argc; i++) {
         cfg.cmd.push_back(argv[i]);
     }
@@ -661,19 +614,18 @@ int main(int argc, char **argv) {
     enable_ip_forward();
 
     try {
-        sparse_file store(32 * 1024 * 1024);
+        sparse_file store(64 * 1024 * 1024);
+        mkfs_ext2(store.path);
         loopback lo(store);
-        lvm_handle lh;
-        volume_group vg(lh, lo);
-        unplug_volume vol0(vg, "vol0", 8 * 1024 * 1024);
 
-        vol0.mkfs_ext2();
-        string mount_path = "/tmp/unplug/" + to_string(getpid()) + "/" + vol0.name;
-        mountpoint vol0_public(vol0.path(), mount_path.c_str(), "ext2");
+        string layer_path = "/tmp/unplug/" + to_string(getpid());
+        mountpoint layer(lo.path, layer_path.c_str(), "ext2");
 
-        run_child(cfg, vol0_public);
+        clone_isolated(layer, cfg.isolated_dirs);
 
-        printf("success\n");
+        run_child(cfg, layer);
+
+        printf("unplug finished\n");
         return 0;
     } catch (const exception &e) {
         printf("error: %s\n", e.what());
