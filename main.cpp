@@ -65,7 +65,7 @@ void enable_ip_forward() {
 struct unplug_config {
     string runas;
     vector<string> isolated_dirs;
-    vector<string> argv;
+    vector<string> cmd;
 };
 
 struct sparse_file {
@@ -587,10 +587,10 @@ void run_unplugged(unplug_config &cfg) {
         if (change_user(cfg.runas))
             exit(1);
 
-        int argc = cfg.argv.size();
+        int argc = cfg.cmd.size();
         char *cmd[argc + 1];
         for (int i = 0; i < argc; i++) {
-            cmd[i] = strdup(cfg.argv[i].c_str());
+            cmd[i] = strdup(cfg.cmd[i].c_str());
         }
         cmd[argc] = NULL;
 
@@ -650,9 +650,9 @@ int main(int argc, char **argv) {
     cfg.runas = "mart";
     cfg.isolated_dirs.push_back("/opt");
     for (int i = 1; i < argc; i++) {
-        cfg.argv.push_back(argv[i]);
+        cfg.cmd.push_back(argv[i]);
     }
-    if (cfg.argv.empty()) {
+    if (cfg.cmd.empty()) {
         printf("no command\n");
         exit(1);
     }
@@ -668,7 +668,8 @@ int main(int argc, char **argv) {
         unplug_volume vol0(vg, "vol0", 8 * 1024 * 1024);
 
         vol0.mkfs_ext2();
-        mountpoint vol0_public(vol0.path(), "/tmp/unplug/vol0", "ext2");
+        string mount_path = "/tmp/unplug/" + to_string(getpid()) + "/" + vol0.name;
+        mountpoint vol0_public(vol0.path(), mount_path.c_str(), "ext2");
 
         run_child(cfg, vol0_public);
 
