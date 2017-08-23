@@ -7,8 +7,6 @@
 #include <memory>
 
 #include <netlink/netlink.h>
-#include <netlink/route/addr.h>
-#include <netlink/route/rule.h>
 #include <netlink/route/link.h>
 #include <netlink/route/link/veth.h>
 
@@ -32,6 +30,7 @@
 
 using std::string;
 using std::vector;
+using std::unique_ptr;
 using std::exception;
 using std::runtime_error;
 using std::to_string;
@@ -62,10 +61,11 @@ void enable_ip_forward() {
         throw runtime_error("ip_forward");
 }
 
-void mkfs_ext2(string path) {
-    struct stat s;
-    if (stat(path.c_str(), &s) || (s.st_mode & S_IFREG) != S_IFREG) {
-        throw runtime_error(path + " not a file");
+void exec(std::initializer_list<string> cmd) {
+    string full_cmd;
+    for (const string &s : cmd) {
+        full_cmd += s;
+        full_cmd += " ";
     }
 
     pid_t pid = fork();
@@ -73,19 +73,65 @@ void mkfs_ext2(string path) {
         throw runtime_error("fork failed");
 
     if (pid == 0) {
-        printf("formatting %s\n", path.c_str());
-        execlp("mkfs.ext2", "mkfs.ext2", "-q", path.c_str(), (char*) NULL);
+        int argc = cmd.size();
+        char *ccmd[argc + 1];
+        int i = 0;
+        for (const string &s : cmd) {
+            ccmd[i++] = strdup(s.c_str());
+        }
+        ccmd[argc] = NULL;
+
+        if (false) {
+            printf("%s\n", full_cmd.c_str());
+        }
+        execvp(ccmd[0], ccmd);
     }
 
     int stat;
     if (waitpid(pid, &stat, 0) != pid || stat != 0)
-        throw runtime_error("mkfs failed " + to_string(errno));
+        throw runtime_error(full_cmd);
+}
+
+void mkfs_ext2(string path) {
+    struct stat s;
+    if (stat(path.c_str(), &s) || (s.st_mode & S_IFREG) != S_IFREG) {
+        throw runtime_error(path + " not a file");
+    }
+
+    exec({"mkfs.ext2", "-q", path});
+}
+
+string ip_to_string(uint32_t raw) {
+    in_addr addr;
+    addr.s_addr = raw;
+    return inet_ntoa(addr);
 }
 
 struct unplug_config {
     string runas;
     vector<string> isolated_dirs;
     vector<string> cmd;
+
+    unplug_config(int argc, char **argv) {
+        int i = 1;
+        while (i < argc - 1) {
+            if (strstr(argv[i], "-u") == argv[i]) {
+                runas = argv[i + 1];
+                i += 2;
+            }
+            else if (strstr(argv[i], "-d") == argv[i]) {
+                isolated_dirs.push_back(argv[i + 1]);
+                i += 2;
+            }
+            else {
+                break;
+            }
+        }
+
+        while (i < argc) {
+            cmd.push_back(argv[i++]);
+        }
+    }
 };
 
 struct sparse_file {
@@ -306,49 +352,12 @@ struct veth_pair {
 
     veth_pair(const veth_pair &src) = delete;
 
-    string subnet_addr() {
-        in_addr addr;
-        addr.s_addr = (10) | ((host_pid % UINT16_MAX) << 8);
-        return inet_ntoa(addr);
-    }
-
     void configure_host() {
-        int err;
-
-        rtnl_link *link;
-        if ((err = rtnl_link_get_kernel(nl_handle.sk, 0, host.c_str(), &link)) < 0) {
-            nl_perror(err, "Unable to refresh link");
-            throw runtime_error("rtnl_link_get_kernel");
-        }
-
-        uint32_t ip_raw = (10) | ((host_pid % UINT16_MAX) << 8) | (1 << 24);
-        nl_addr *ip = nl_addr_build(AF_INET, &ip_raw, sizeof(ip_raw));
-        nl_addr_set_prefixlen(ip, 30);
-
-        rtnl_addr *addr = rtnl_addr_alloc();
-        rtnl_addr_set_family(addr, AF_INET);
-        rtnl_addr_set_link(addr, link);
-        rtnl_addr_set_local(addr, ip);
-
-        if ((err = rtnl_addr_add(nl_handle.sk, addr, 0)) < 0) {
-            nl_perror(err, "Unable to set link ip");
-            throw runtime_error("rtnl_addr_add");
-        }
-
-        rtnl_link *req = rtnl_link_alloc();
-        rtnl_link_set_flags(req, IFF_UP | IFF_RUNNING);
-
-        if ((err = rtnl_link_change(nl_handle.sk, link, req, 0)) < 0) {
-            nl_perror(err, "Unable to set link up");
-            throw runtime_error("rtnl_link_change");
-        }
-
-        string nat_command = "iptables -t nat -A POSTROUTING -s " + subnet_addr() + "/30 -j MASQUERADE";
-        if (system(nat_command.c_str()))
-            throw runtime_error("MASQUERADE");
-
-        rtnl_link_put(req);
-        rtnl_link_put(link);
+        uint32_t host_raw = (10) | ((host_pid % UINT16_MAX) << 8) | (1 << 24);
+        uint32_t subnet_raw = (10) | ((host_pid % UINT16_MAX) << 8);
+        exec({"ip", "address", "add", ip_to_string(host_raw) + "/30", "dev", host});
+        exec({"ip", "link", "set", "dev", host, "up"});
+        exec({"iptables", "-t", "nat", "-A", "POSTROUTING", "-s", ip_to_string(subnet_raw) + "/30", "-j", "MASQUERADE"});
     }
 
     void assign_to_container_ns() {
@@ -373,93 +382,22 @@ struct veth_pair {
         rtnl_link_put(peer);
     }
 
-    void add_gateway(nl_sock *sk) {
-        int err;
-
-        uint32_t gw_raw = (10) | ((host_pid % UINT16_MAX) << 8) | (1 << 24);
-        nl_addr *gw_ip = nl_addr_build(AF_INET, &gw_raw, sizeof(gw_raw));
-
-        nl_addr *gw_target;
-        nl_addr_parse("0.0.0.0/0", AF_INET, &gw_target);
-
-        rtnl_route *route_gw = rtnl_route_alloc();
-        rtnl_route_set_dst(route_gw, gw_target);
-
-        rtnl_nexthop *nh = rtnl_route_nh_alloc();
-        rtnl_route_nh_set_gateway(nh, gw_ip);
-        rtnl_route_add_nexthop(route_gw, nh);
-
-        if ((err = rtnl_route_add(sk, route_gw, NLM_F_CREATE)) < 0) {
-            nl_perror(err, "Unable to add default gateway");
-            throw runtime_error("rtnl_route_add");
-        }
-
-        rtnl_route_put(route_gw);
-        nl_addr_put(gw_ip);
-        nl_addr_put(gw_target);
-    }
-
     void configure_container() {
-        int err;
-
-        // TODO unhack
-        nl_sock *sk = nl_socket_alloc();
-        if ((err = nl_connect(sk, NETLINK_ROUTE)) < 0) {
-            nl_perror(err, "Unable to connect socket");
-            throw runtime_error("nl_connect");
-        }
-
-        rtnl_link *lo;
-        if ((err = rtnl_link_get_kernel(sk, 0, "lo", &lo)) < 0) {
-            nl_perror(err, "Unable to refresh lo");
-            throw runtime_error("rtnl_link_get_kernel");
-        }
-        rtnl_link *req_lo = rtnl_link_alloc();
-        rtnl_link_set_flags(req_lo, IFF_UP | IFF_RUNNING);
-        if ((err = rtnl_link_change(sk, lo, req_lo, 0)) < 0) {
-            nl_perror(err, "Unable to set lo up");
-            throw runtime_error("rtnl_link_change");
-        }
-        rtnl_link_put(lo);
-
-        rtnl_link *peer;
-        if ((err = rtnl_link_get_kernel(sk, 0, container.c_str(), &peer)) < 0) {
-            nl_perror(err, "Unable to refresh peer");
-            throw runtime_error("rtnl_link_get_kernel");
-        }
-
-        uint32_t ip_raw = (10) | ((host_pid % UINT16_MAX) << 8) | (2 << 24);
-        nl_addr *ip = nl_addr_build(AF_INET, &ip_raw, sizeof(ip_raw));
-        nl_addr_set_prefixlen(ip, 30);
-
-        rtnl_addr *addr = rtnl_addr_alloc();
-        rtnl_addr_set_family(addr, AF_INET);
-        rtnl_addr_set_link(addr, peer);
-        rtnl_addr_set_local(addr, ip);
-
-        if ((err = rtnl_addr_add(sk, addr, 0)) < 0) {
-            nl_perror(err, "Unable to set peer ip");
-            throw runtime_error("rtnl_addr_add");
-        }
-
-        rtnl_link *req = rtnl_link_alloc();
-        rtnl_link_set_flags(req, IFF_UP | IFF_RUNNING);
-
-        if ((err = rtnl_link_change(sk, peer, req, 0)) < 0) {
-            nl_perror(err, "Unable to set peer up");
-            throw runtime_error("rtnl_link_change");
-        }
-
-        add_gateway(sk);
-
-        rtnl_link_put(req);
-        rtnl_link_put(peer);
-        nl_close(sk);
+        uint32_t container_raw = (10) | ((host_pid % UINT16_MAX) << 8) | (2 << 24);
+        uint32_t gw_raw = (10) | ((host_pid % UINT16_MAX) << 8) | (1 << 24);
+        exec({"ip", "address", "add", ip_to_string(container_raw) + "/30", "dev", container});
+        exec({"ip", "link", "set", "dev", "lo", "up"});
+        exec({"ip", "link", "set", "dev", container, "up"});
+        exec({"ip", "route", "add", "0.0.0.0/0", "via", ip_to_string(gw_raw)});
     }
 
     virtual ~veth_pair() {
-        string nat_cleanup = "iptables -t nat -D POSTROUTING -s " + subnet_addr() + "/30 -j MASQUERADE";
-        system(nat_cleanup.c_str());
+        uint32_t subnet_raw = (10) | ((host_pid % UINT16_MAX) << 8);
+        try {
+            exec({"iptables", "-t", "nat", "-D", "POSTROUTING", "-s", ip_to_string(subnet_raw) + "/30", "-j", "MASQUERADE"});
+        } catch (const exception &e) {
+            perror(e.what());
+        }
 
         rtnl_link *link = rtnl_link_alloc();
         rtnl_link_set_name(link, host.c_str());
@@ -508,7 +446,7 @@ void run_unplugged(unplug_config &cfg) {
         throw runtime_error("fork failed (unplugged)");
 
     if (pid == 0) {
-        if (change_user(cfg.runas))
+        if (!cfg.runas.empty() && change_user(cfg.runas))
             exit(1);
 
         int argc = cfg.cmd.size();
@@ -555,10 +493,10 @@ void run_child(unplug_config &cfg, mountpoint &layer) {
             }
 
             /* scope for destructors */ {
-                vector<std::unique_ptr<mountpoint>> binds;
+                vector<unique_ptr<mountpoint>> binds;
                 for (string isolated : cfg.isolated_dirs) {
                     string layer_dir = layer.to + isolated;
-                    binds.push_back(std::unique_ptr<mountpoint>(new mountpoint(layer_dir, isolated, "none", MS_BIND)));
+                    binds.push_back(unique_ptr<mountpoint>(new mountpoint(layer_dir, isolated, "none", MS_BIND)));
                 }
                 run_unplugged(cfg);
             }
@@ -586,27 +524,15 @@ void clone_isolated(mountpoint &layer, vector<string> &sources) {
         string target_parent = target.substr(0, target.find_last_of("/"));
 
         printf("cloning %s -> %s\n", source.c_str(), layer.to.c_str());
-
-        string mkdir_cmd = "mkdir -p '" + target_parent + "'";
-        if (system(mkdir_cmd.c_str()))
-            throw runtime_error(mkdir_cmd);
-
-        string cp_cmd = "cp -a '" + source + "' '" + target_parent + "'";
-        if (system(cp_cmd.c_str()))
-            throw runtime_error(cp_cmd);
+        exec({"mkdir", "-p", target_parent});
+        exec({"cp", "-a", source, target_parent});
     }
 }
 
 int main(int argc, char **argv) {
-    unplug_config cfg;
-    cfg.runas = "mart";
-    cfg.isolated_dirs.push_back("/tmp/potato1");
-    cfg.isolated_dirs.push_back("/tmp/potato2");
-    for (int i = 1; i < argc; i++) {
-        cfg.cmd.push_back(argv[i]);
-    }
+    unplug_config cfg(argc, argv);
     if (cfg.cmd.empty()) {
-        printf("no command\n");
+        printf("usage: unplug [-u username] [-d abs_path]* <command ...>\n");
         exit(1);
     }
 
