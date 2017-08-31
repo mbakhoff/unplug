@@ -59,6 +59,8 @@ void exec(std::initializer_list<string> cmd) {
         fail("fork failed");
 
     if (pid == 0) {
+        fclose(stdin);
+
         int argc = cmd.size();
         char *ccmd[argc + 1];
         int i = 0;
