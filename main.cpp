@@ -111,7 +111,7 @@ struct sparse_file {
         string dir = home + "/.unplug";
         if (mkdir(dir.c_str(), 0755)) {
             if (errno != EEXIST) {
-                throw runtime_error("failed to create " + dir);
+                fail("failed to create " + dir);
             }
         }
 
@@ -119,23 +119,19 @@ struct sparse_file {
 
         fd = open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
         if (fd == -1) {
-            dump_error("open");
-            throw runtime_error("failed to create store (open) " + path);
+            fail("failed to create store " + path);
         }
 
         FILE *file = fdopen(fd, "w");
         if (fseek(file, size - 1, SEEK_SET)) {
-            dump_error("fseek");
-            throw runtime_error("failed to create store (seek) " + path);
+            fail("failed to create store " + path);
         }
         char null_byte = 0;
         if (fwrite(&null_byte, 1, 1, file) != 1) {
-            dump_error("fwrite");
-            throw runtime_error("failed to create store (write) " + path);
+            fail("failed to create store " + path);
         }
         if (fflush(file)) {
-            dump_error("fflush");
-            throw runtime_error("failed to create store (flush) " + path);
+            fail("failed to create store " + path);
         }
     }
 
@@ -160,7 +156,7 @@ struct loopback {
             if (mknod(path.c_str(), S_IFBLK | 0660, makedev(7, i))) {
                 if (errno == EEXIST)
                     continue;
-                throw runtime_error("failed to create loop device " + to_string(errno));
+                fail("failed to create loop device " + path);
             }
 
             fd = open(path.c_str(), O_RDWR);
@@ -206,7 +202,7 @@ struct mountpoint {
         printf("mounting %s to %s\n", from.c_str(), to.c_str());
         if (mount(from.c_str(), to.c_str(), fstype.c_str(), flags, NULL)) {
             rmdirs(created_dirs);
-            throw runtime_error("mount(" + from + ", " + to + ") failed: " + to_string(errno));
+            fail("mount from=" + from + " to=" + to);
         }
     }
 
@@ -228,7 +224,7 @@ struct mountpoint {
             for (string &ancestor : ancestors(path)) {
                 if (mkdir(ancestor.c_str(), 0755)) {
                     if (errno != EEXIST)
-                        throw runtime_error("failed to mkdir " + path);
+                        fail("failed to mkdir " + path);
                 } else {
                     created.push_back(ancestor);
                 }
@@ -236,7 +232,7 @@ struct mountpoint {
 
             struct stat s;
             if (stat(path.c_str(), &s) || (s.st_mode & S_IFDIR) != S_IFDIR) {
-                throw runtime_error(path + " not a directory");
+                fail(path + " not a directory");
             }
         } catch (runtime_error &e) {
             rmdirs(created);
@@ -393,7 +389,7 @@ int change_user(const string &user) {
 void run_unplugged(unplug_config &cfg) {
     pid_t pid = fork();
     if (pid == -1)
-        throw runtime_error("fork failed (unplugged)");
+        fail("fork failed (unplugged)");
 
     if (pid == 0) {
         if (!cfg.runas.empty() && change_user(cfg.runas))
@@ -421,7 +417,7 @@ void run_child(unplug_config &cfg, mountpoint &layer) {
     pid_t parent = getpid();
     pid_t pid = fork();
     if (pid == -1)
-        throw runtime_error("fork failed");
+        fail("fork failed");
 
     if (pid == 0) {
         string pid_str = to_string(parent);
@@ -460,8 +456,7 @@ void run_child(unplug_config &cfg, mountpoint &layer) {
 
     int result = waitpid(pid, NULL, 0);
     if (result != pid) {
-        perror("waiting for child");
-        throw runtime_error("waitpid");
+        fail("waiting for child");
     }
 }
 

@@ -3,8 +3,21 @@
 
 #include <string>
 #include <vector>
+#include <stdexcept>
+
 using std::string;
 using std::vector;
+using std::runtime_error;
+
+#define fail(message) \
+    throw errno_error(message, __FILE__, __LINE__);
+
+class errno_error: public runtime_error {
+    string what_message;
+public:
+    errno_error(const string &message, const string &file, long line);
+    virtual const char* what() const noexcept;
+};
 
 void file_write(const string &path, const string &data);
 void exec(std::initializer_list<string> cmd);

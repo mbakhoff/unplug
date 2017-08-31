@@ -13,26 +13,37 @@
 #include "utils.h"
 
 using std::runtime_error;
+using std::to_string;
+
+string strip_dir(const string &path) {
+    size_t pos = path.find_last_of('/');
+    return pos == string::npos || pos == path.length() ? path : path.substr(pos + 1);
+}
+
+errno_error::errno_error(const string &message, const string &file, long line): runtime_error(message) {
+    this->what_message = message + " (" + strip_dir(file) + ":" + to_string(line) + " errno " + to_string(errno) + ": " + strerror(errno) + ")";
+}
+
+const char* errno_error::what() const noexcept {
+    return this->what_message.c_str();
+}
 
 void file_write(const string &path, const string &data) {
     FILE *fh = fopen(path.c_str(), "w");
     if (fh == NULL) {
-        perror("fopen");
-        throw runtime_error(path);
+        fail("writing " + path);
     }
 
     if (!data.empty()) {
         size_t total = data.length();
         if (fwrite(data.c_str(), 1, total, fh) != total) {
-            perror("fwrite");
             fclose(fh);
-            throw runtime_error(path);
+            fail("writing " + path);
         }
     }
 
     if (fclose(fh)) {
-        perror("fclose");
-        throw runtime_error("fclose");
+        fail("writing " + path);
     }
 }
 
@@ -45,7 +56,7 @@ void exec(std::initializer_list<string> cmd) {
 
     pid_t pid = fork();
     if (pid == -1)
-        throw runtime_error("fork failed");
+        fail("fork failed");
 
     if (pid == 0) {
         int argc = cmd.size();
@@ -70,8 +81,7 @@ void exec(std::initializer_list<string> cmd) {
 bool is_regular(const string &path) {
     struct stat s;
     if (stat(path.c_str(), &s)) {
-        perror("stat");
-        throw runtime_error(path);
+        fail("stat " + path);
     }
     return (s.st_mode & S_IFREG) == S_IFREG;
 }
@@ -100,8 +110,7 @@ vector<string> list_dir(const string &path) {
     vector<string> result;
     DIR *d = opendir(path.c_str());
     if (!d) {
-        perror("opendir");
-        throw runtime_error(path);
+        fail("listing " + path);
     }
     struct dirent *entry;
     errno = 0;
@@ -111,8 +120,7 @@ vector<string> list_dir(const string &path) {
         result.push_back(entry->d_name);
     }
     if (errno != 0) {
-        perror("readdir");
-        throw runtime_error(path);
+        fail("listing " + path);
     }
     closedir(d);
     return result;
@@ -132,8 +140,7 @@ uint64_t dir_size(const string &path) {
         string child = path_join(path, file);
         struct stat s;
         if (stat(child.c_str(), &s)) {
-            perror("stat");
-            throw runtime_error(child);
+            fail("stat " + child);
         }
         if ((s.st_mode & S_IFREG) == S_IFREG) {
             total += s.st_size;
