@@ -28,6 +28,8 @@
 #include <grp.h>
 #include <pwd.h>
 
+#include "utils.h"
+
 using std::string;
 using std::vector;
 using std::unique_ptr;
@@ -52,59 +54,14 @@ void install_signal_handlers() {
 }
 
 void enable_ip_forward() {
-    FILE *ip_forward = fopen("/proc/sys/net/ipv4/ip_forward", "w");
-    if (ip_forward == NULL)
-        throw runtime_error("ip_forward");
-    char enable = '1';
-    int w = fwrite(&enable, 1, 1, ip_forward);
-    if (fclose(ip_forward) || w != 1)
-        throw runtime_error("ip_forward");
+    file_write("/proc/sys/net/ipv4/ip_forward", "1");
 }
 
-void exec(std::initializer_list<string> cmd) {
-    string full_cmd;
-    for (const string &s : cmd) {
-        full_cmd += s;
-        full_cmd += " ";
-    }
-
-    pid_t pid = fork();
-    if (pid == -1)
-        throw runtime_error("fork failed");
-
-    if (pid == 0) {
-        int argc = cmd.size();
-        char *ccmd[argc + 1];
-        int i = 0;
-        for (const string &s : cmd) {
-            ccmd[i++] = strdup(s.c_str());
-        }
-        ccmd[argc] = NULL;
-
-        if (false) {
-            printf("%s\n", full_cmd.c_str());
-        }
-        execvp(ccmd[0], ccmd);
-    }
-
-    int stat;
-    if (waitpid(pid, &stat, 0) != pid || stat != 0)
-        throw runtime_error(full_cmd);
-}
-
-void mkfs_ext2(string path) {
-    struct stat s;
-    if (stat(path.c_str(), &s) || (s.st_mode & S_IFREG) != S_IFREG) {
+void mkfs_ext2(const string &path) {
+    if (!is_regular(path)) {
         throw runtime_error(path + " not a file");
     }
-
-    exec({"mkfs.ext2", "-q", path});
-}
-
-string ip_to_string(uint32_t raw) {
-    in_addr addr;
-    addr.s_addr = raw;
-    return inet_ntoa(addr);
+    exec({"mkfs.ext2", "-q", path}); // TODO ext4 w/o journal?
 }
 
 struct unplug_config {
@@ -268,20 +225,13 @@ struct mountpoint {
         if (path.at(0) != '/')
             throw runtime_error("mountpoint must be absolute path");
         try {
-            size_t offset = 1;
-            while (offset < path.length()) {
-                size_t pos = path.find('/', offset);
-                if (pos == string::npos) {
-                    pos = path.length();
-                }
-                string parent = path.substr(0, pos);
-                if (mkdir(parent.c_str(), 0755)) {
+            for (string &ancestor : ancestors(path)) {
+                if (mkdir(ancestor.c_str(), 0755)) {
                     if (errno != EEXIST)
                         throw runtime_error("failed to mkdir " + path);
                 } else {
-                    created.push_back(parent);
+                    created.push_back(ancestor);
                 }
-                offset = pos + 1;
             }
 
             struct stat s;
@@ -529,6 +479,19 @@ void clone_isolated(mountpoint &layer, vector<string> &sources) {
     }
 }
 
+uint64_t calculate_store_size(const vector<string> dirs) {
+    uint64_t total = 0;
+    for (const string &dir : dirs) {
+        total += dir_size(dir);
+    }
+
+    uint64_t mb128 = 128 * 1024 * 1024;
+    if (total < mb128)
+        return mb128;
+
+    return total * 1.1 + mb128 * 2;
+}
+
 int main(int argc, char **argv) {
     unplug_config cfg(argc, argv);
     if (cfg.cmd.empty()) {
@@ -540,7 +503,7 @@ int main(int argc, char **argv) {
     enable_ip_forward();
 
     try {
-        sparse_file store(64 * 1024 * 1024);
+        sparse_file store(calculate_store_size(cfg.isolated_dirs));
         mkfs_ext2(store.path);
         loopback lo(store);
 
