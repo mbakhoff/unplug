@@ -37,11 +37,13 @@ using std::exception;
 using std::runtime_error;
 using std::to_string;
 
+int exit_signal_caught = 0;
+
 #define dump_error(fn) \
     printf("%s: %s (%d) #%d\n", fn, strerror(errno), errno, __LINE__);
 
 void on_close_signal(int sig) {
-    printf("caught signal %d\n", sig);
+    exit_signal_caught = sig;
 }
 
 void install_signal_handlers() {
@@ -49,8 +51,20 @@ void install_signal_handlers() {
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_close_signal;
     sigfillset(&sa.sa_mask);
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
+    if (sigaction(SIGINT, &sa, NULL))
+        fail("sigaction");
+    if (sigaction(SIGTERM, &sa, NULL))
+        fail("sigaction");
+}
+
+void clear_signal_handlers() {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIG_DFL;
+    if (sigaction(SIGINT, &sa, NULL))
+        fail("sigaction");
+    if (sigaction(SIGTERM, &sa, NULL))
+        fail("sigaction");
 }
 
 void enable_ip_forward() {
@@ -366,6 +380,44 @@ struct veth_pair {
     }
 };
 
+string gen_cgroup_name() {
+    return "/sys/fs/cgroup/cpu/unplug-" + to_string(getpid());
+}
+
+struct cpu_cgroup {
+
+    string dir;
+
+    cpu_cgroup(): dir(gen_cgroup_name()) {
+        if (mkdir(dir.c_str(), 0755))
+            fail("mkdir " + dir);
+    }
+
+    void add_pid(pid_t pid) {
+        file_write(dir + "/cgroup.procs", to_string(pid));
+    }
+
+    vector<pid_t> list() {
+        vector<pid_t> result;
+        string procs = file_read_fully(dir + "/cgroup.procs");
+        int offset = 0;
+        while (true) {
+            size_t nl = procs.find_first_of('\n', offset);
+            if (nl == string::npos)
+                break;
+            string pid = procs.substr(offset, nl - offset);
+            result.push_back(std::stoi(pid));
+            offset = nl + 1;
+        }
+        return result;
+    }
+
+    virtual ~cpu_cgroup() {
+        if (rmdir(dir.c_str()))
+            printf("failed to clean up cgroup\n");
+    }
+};
+
 int change_user(const string &user) {
     struct passwd *pw = getpwnam(user.c_str());
     if (pw == NULL) {
@@ -394,12 +446,67 @@ int change_user(const string &user) {
     return 0;
 }
 
-void run_unplugged(unplug_config &cfg) {
+void await_container(pid_t pid) {
+    while (true) {
+        if (exit_signal_caught) {
+            printf("caught signal %d, propagating\n", exit_signal_caught);
+            kill(pid, exit_signal_caught);
+        }
+        int result = waitpid(pid, NULL, 0);
+        if (result == pid)
+            break;
+        if (errno == EINTR)
+            continue;
+        fail("waiting for child");
+    }
+}
+
+void kill_cgroup(cpu_cgroup &tracked_cgroup) {
+    for (int ttl = 15; ttl >= 0; ttl--) {
+        vector<pid_t> descendants = tracked_cgroup.list();
+        if (tracked_cgroup.list().empty()) {
+            break;
+        }
+
+        int sig = ttl > 0 ? SIGTERM : SIGKILL;
+        for (pid_t descendant : descendants) {
+            printf("kill -%d %d\n", sig, descendant);
+            kill(descendant, sig);
+            if (sig == SIGKILL) {
+                waitpid(descendant, NULL, 0);
+            }
+        }
+        sleep(1);
+    }
+}
+
+void await_command(pid_t pid, cpu_cgroup &tracked_cgroup) {
+    while (true) {
+        if (exit_signal_caught)
+            break;
+        int result = waitpid(pid, NULL, 0);
+        if (result == pid)
+            break;
+        if (errno == EINTR)
+            continue;
+        fail("waiting for child");
+    }
+
+    printf("terminating command cgroup\n");
+    kill_cgroup(tracked_cgroup);
+}
+
+void run_unplugged(unplug_config &cfg, cpu_cgroup &tracked_cgroup) {
+    if (exit_signal_caught)
+        return;
+
     pid_t pid = fork();
     if (pid == -1)
         fail("fork failed (unplugged)");
 
     if (pid == 0) {
+        clear_signal_handlers();
+
         if (!cfg.runas.empty() && change_user(cfg.runas))
             exit(1);
 
@@ -413,10 +520,13 @@ void run_unplugged(unplug_config &cfg) {
         execvp(cmd[0], cmd);
     }
 
-    waitpid(pid, NULL, 0);
+    tracked_cgroup.add_pid(pid);
+    await_command(pid, tracked_cgroup);
 }
 
 void run_child(unplug_config &cfg, mountpoint &layer) {
+    if (exit_signal_caught)
+        return;
 
     nl_sock_handle nl_handle;
     veth_pair veth(nl_handle);
@@ -447,14 +557,16 @@ void run_child(unplug_config &cfg, mountpoint &layer) {
             }
 
             /* scope for destructors */ {
+                cpu_cgroup tracked_cgroup;
                 vector<unique_ptr<mountpoint>> binds;
                 for (string isolated : cfg.isolated_dirs) {
                     string layer_dir = layer.to + isolated;
                     binds.push_back(unique_ptr<mountpoint>(new mountpoint(layer_dir, isolated, "none", MS_BIND)));
                 }
-                run_unplugged(cfg);
+                run_unplugged(cfg, tracked_cgroup);
             }
 
+            printf("container done\n");
             exit(0);
         } catch (exception &e) {
             printf("exception in fork: %s\n", e.what());
@@ -462,10 +574,7 @@ void run_child(unplug_config &cfg, mountpoint &layer) {
         }
     }
 
-    int result = waitpid(pid, NULL, 0);
-    if (result != pid) {
-        fail("waiting for child");
-    }
+    await_container(pid);
 }
 
 void clone_isolated(mountpoint &layer, vector<string> &sources) {

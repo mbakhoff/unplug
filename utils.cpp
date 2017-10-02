@@ -47,6 +47,30 @@ void file_write(const string &path, const string &data) {
     }
 }
 
+string file_read_fully(const string &path) {
+    FILE *fh = fopen(path.c_str(), "r");
+    if (fh == NULL) {
+        fail("reading " + path);
+    }
+
+    string result;
+    char buf[1024];
+    size_t r;
+    while ((r = fread(buf, 1, sizeof(buf), fh)) >= 0) {
+        if (ferror(fh))
+            fail("reading " + path);
+        result.append(buf, r);
+        if (feof(fh))
+            break;
+    }
+
+    if (fclose(fh)) {
+        fail("reading " + path);
+    }
+
+    return result;
+}
+
 void exec(std::initializer_list<string> cmd) {
     string full_cmd;
     for (const string &s : cmd) {

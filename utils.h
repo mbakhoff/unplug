@@ -20,6 +20,7 @@ public:
 };
 
 void file_write(const string &path, const string &data);
+string file_read_fully(const string &path);
 void exec(std::initializer_list<string> cmd);
 bool is_regular(const string &path);
 string ip_to_string(uint32_t ip);
