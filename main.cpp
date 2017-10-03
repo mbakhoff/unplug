@@ -325,9 +325,9 @@ struct veth_pair {
         uint32_t subnet_raw = (10) | ((host_pid % UINT16_MAX) << 8);
         exec({"ip", "address", "add", ip_to_string(host_raw) + "/30", "dev", host});
         exec({"ip", "link", "set", "dev", host, "up"});
-        exec({"iptables", "-t", "nat", "-I", "POSTROUTING", "1", "-s", ip_to_string(subnet_raw) + "/30", "-j", "MASQUERADE"});
-        exec({"iptables", "-I", "FORWARD", "1", "-i", host, "-j", "ACCEPT"});
-        exec({"iptables", "-I", "FORWARD", "1", "-o", host, "-j", "ACCEPT"});
+        exec({"iptables", "-w", "10", "-t", "nat", "-I", "POSTROUTING", "1", "-s", ip_to_string(subnet_raw) + "/30", "-j", "MASQUERADE"});
+        exec({"iptables", "-w", "10", "-I", "FORWARD", "1", "-i", host, "-j", "ACCEPT"});
+        exec({"iptables", "-w", "10", "-I", "FORWARD", "1", "-o", host, "-j", "ACCEPT"});
     }
 
     void assign_to_container_ns() {
@@ -364,13 +364,13 @@ struct veth_pair {
     virtual ~veth_pair() {
         uint32_t subnet_raw = (10) | ((host_pid % UINT16_MAX) << 8);
         try {
-            exec({"iptables", "-D", "FORWARD", "-i", host, "-j", "ACCEPT"});
-            exec({"iptables", "-D", "FORWARD", "-o", host, "-j", "ACCEPT"});
+            exec({"iptables", "-w", "10", "-D", "FORWARD", "-i", host, "-j", "ACCEPT"});
+            exec({"iptables", "-w", "10", "-D", "FORWARD", "-o", host, "-j", "ACCEPT"});
         } catch (const exception &e) {
             perror(e.what());
         }
         try {
-            exec({"iptables", "-t", "nat", "-D", "POSTROUTING", "-s", ip_to_string(subnet_raw) + "/30", "-j", "MASQUERADE"});
+            exec({"iptables", "-w", "10", "-t", "nat", "-D", "POSTROUTING", "-s", ip_to_string(subnet_raw) + "/30", "-j", "MASQUERADE"});
         } catch (const exception &e) {
             perror(e.what());
         }
