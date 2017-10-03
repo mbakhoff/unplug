@@ -91,7 +91,10 @@ struct unplug_config {
                 i += 2;
             }
             else if (strstr(argv[i], "-d") == argv[i]) {
-                isolated_dirs.push_back(argv[i + 1]);
+                string dir = argv[i + 1];
+                while (!dir.empty() && dir.back() == '/')
+                    dir.pop_back();
+                isolated_dirs.push_back(dir);
                 i += 2;
             }
             else {
