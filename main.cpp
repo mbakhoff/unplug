@@ -80,7 +80,7 @@ void mkfs_ext2(const string &path) {
 
 struct unplug_config {
     string runas;
-    uint64_t spare_space;
+    string workspace;
     vector<string> isolated_dirs;
     vector<string> cmd;
 
@@ -91,8 +91,10 @@ struct unplug_config {
                 runas = argv[i + 1];
                 i += 2;
             }
-            else if (strstr(argv[i], "-s") == argv[i]) {
-                spare_space = std::stoll(argv[i + 1]);
+            else if (strstr(argv[i], "-w") == argv[i]) {
+                workspace = argv[i + 1];
+                while (!workspace.empty() && workspace.back() == '/')
+                    workspace.pop_back();
                 i += 2;
             }
             else if (strstr(argv[i], "-d") == argv[i]) {
@@ -113,124 +115,54 @@ struct unplug_config {
     }
 };
 
-struct sparse_file {
+struct workspace {
 
-    int fd;
-    string path;
-    int size;
+    string root;
 
-    sparse_file(uint64_t size) {
-        this->size = size;
-
-        char *envhome = getenv("HOME");
-        string home;
-        if (envhome == NULL) {
-            home = "/tmp";
+    workspace(const unplug_config &cfg) {
+        if (cfg.workspace.empty()) {
+            char *envhome = getenv("HOME");
+            if (envhome == NULL)
+                fail("workspace not configured and HOME not set");
+            root = string() + envhome + "/.unplug/" + to_string(getpid());
         } else {
-            home = envhome;
+            root = cfg.workspace + "/" + to_string(getpid());
         }
-
-        string dir = home + "/.unplug";
-        if (mkdir(dir.c_str(), 0755)) {
-            if (errno != EEXIST) {
-                fail("failed to create " + dir);
+        for (const string &dir : ancestors(root)) {
+            if (mkdir(dir.c_str(), 0755) && errno != EEXIST) {
+                fail("mkdir " + dir);
             }
-        }
-
-        path = dir + "/store-" + to_string(getpid());
-
-        fd = open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
-        if (fd == -1) {
-            fail("failed to create store " + path);
-        }
-
-        FILE *file = fdopen(fd, "w");
-        if (fseek(file, size - 1, SEEK_SET)) {
-            fail("failed to create store " + path);
-        }
-        char null_byte = 0;
-        if (fwrite(&null_byte, 1, 1, file) != 1) {
-            fail("failed to create store " + path);
-        }
-        if (fflush(file)) {
-            fail("failed to create store " + path);
         }
     }
 
-    sparse_file(const sparse_file &src) = delete;
+    workspace(const workspace &src) = delete;
 
-    virtual ~sparse_file() {
-        close(fd);
-        unlink(path.c_str());
+    virtual ~workspace() {
+        try {
+            exec({"rm", "-rf", root});
+        } catch (const exception &e) {
+            fprintf(stderr, "failed to clean workspace %s: %s\n", root.c_str(), e.what());
+        }
     }
 };
 
-struct loopback {
-
-    int fd;
-    int id;
-    string path;
-
-    loopback(sparse_file &store) {
-        bool created;
-        for (int i = 0; i < 256; i++) {
-            path = "/dev/loop" + to_string(i);
-            if (mknod(path.c_str(), S_IFBLK | 0660, makedev(7, i))) {
-                if (errno == EEXIST)
-                    continue;
-                fail("failed to create loop device " + path);
-            }
-
-            fd = open(path.c_str(), O_RDWR);
-            if (fd == -1) {
-                unlink(path.c_str());
-                printf("trying %s\n", path.c_str());
-                dump_error("loopback");
-                continue;
-            }
-            if (ioctl(fd, LOOP_SET_FD, store.fd)) {
-                close(fd);
-                unlink(path.c_str());
-                printf("trying %s\n", path.c_str());
-                dump_error("loopback");
-                continue;
-            }
-
-            id = i;
-            created = true;
-            break;
-        }
-        if (!created) {
-            throw runtime_error("could not find any good loop devices");
-        }
-    }
-
-    loopback(const loopback &src) = delete;
-
-    virtual ~loopback() {
-        ioctl(fd, LOOP_CLR_FD);
-        close(fd);
-        unlink(path.c_str());
-    }
-};
-
-struct mountpoint {
+struct mount_bind {
 
     vector<string> created_dirs;
     string from, to;
 
-    mountpoint(const string &from, const string &to, const string &fstype, uint64_t flags = 0) : from(from), to(to) {
+    mount_bind(const string &from, const string &to) : from(from), to(to) {
         mkdirs(to, created_dirs);
         printf("mounting %s to %s\n", from.c_str(), to.c_str());
-        if (mount(from.c_str(), to.c_str(), fstype.c_str(), flags, NULL)) {
+        if (mount(from.c_str(), to.c_str(), "none", MS_BIND, NULL)) {
             rmdirs(created_dirs);
             fail("mount from=" + from + " to=" + to);
         }
     }
 
-    mountpoint(const mountpoint &src) = delete;
+    mount_bind(const mount_bind &src) = delete;
 
-    virtual ~mountpoint() {
+    virtual ~mount_bind() {
         //if (umount2(to.c_str(), MNT_DETACH)) {
         if (umount(to.c_str())) {
             fprintf(stderr, "failed to unmount %s\n", to.c_str());
@@ -285,6 +217,8 @@ struct nl_sock_handle {
             throw runtime_error("nl_connect");
         }
     }
+
+    nl_sock_handle(const nl_sock_handle &src) = delete;
 
     virtual ~nl_sock_handle() {
         nl_close(sk);
@@ -400,6 +334,8 @@ struct cpu_cgroup {
         if (mkdir(dir.c_str(), 0755))
             fail("mkdir " + dir);
     }
+
+    cpu_cgroup(const cpu_cgroup &src) = delete;
 
     void add_pid(pid_t pid) {
         file_write(dir + "/cgroup.procs", to_string(pid));
@@ -532,7 +468,7 @@ void run_unplugged(unplug_config &cfg, cpu_cgroup &tracked_cgroup) {
     await_command(pid, tracked_cgroup);
 }
 
-void run_child(unplug_config &cfg, mountpoint &layer) {
+void run_child(unplug_config &cfg, workspace &ws) {
     if (exit_signal_caught)
         return;
 
@@ -566,10 +502,10 @@ void run_child(unplug_config &cfg, mountpoint &layer) {
 
             /* scope for destructors */ {
                 cpu_cgroup tracked_cgroup;
-                vector<unique_ptr<mountpoint>> binds;
+                vector<unique_ptr<mount_bind>> binds;
                 for (string isolated : cfg.isolated_dirs) {
-                    string layer_dir = layer.to + isolated;
-                    binds.push_back(unique_ptr<mountpoint>(new mountpoint(layer_dir, isolated, "none", MS_BIND)));
+                    string layer_dir = ws.root + isolated;
+                    binds.push_back(unique_ptr<mount_bind>(new mount_bind(layer_dir, isolated)));
                 }
                 run_unplugged(cfg, tracked_cgroup);
             }
@@ -585,25 +521,15 @@ void run_child(unplug_config &cfg, mountpoint &layer) {
     await_container(pid);
 }
 
-void clone_isolated(mountpoint &layer, vector<string> &sources) {
+void clone_isolated(workspace &ws, vector<string> &sources) {
     for (string &source : sources) {
-        string target = layer.to + source;
+        string target = ws.root + source;
         string target_parent = target.substr(0, target.find_last_of("/"));
 
-        printf("cloning %s -> %s\n", source.c_str(), layer.to.c_str());
+        printf("cloning %s -> %s\n", source.c_str(), ws.root.c_str());
         exec({"mkdir", "-p", target_parent});
         exec({"cp", "-a", source, target_parent});
     }
-}
-
-uint64_t calculate_store_size(const unplug_config &cfg) {
-    uint64_t total = 0;
-    for (const string &dir : cfg.isolated_dirs) {
-        total += dir_size(dir);
-    }
-
-    uint64_t mb2048 = 2L * 1024L * 1024L * 1024L;
-    return total + (cfg.spare_space > 0 ? cfg.spare_space : mb2048);
 }
 
 void verify_dirs(const vector<string> &dirs) {
@@ -624,8 +550,9 @@ void verify_dirs(const vector<string> &dirs) {
 
 int main(int argc, char **argv) {
     unplug_config cfg(argc, argv);
-    if (cfg.cmd.empty()) {
-        printf("usage: unplug [-u username] [-s spare_disk_space] [-d abs_path]* <command ...>\n");
+    if (cfg.cmd.empty()) {        
+        printf("usage: unplug [-u username] [-w workspace_abs_path] [-d abs_path]* <command ...>\n");
+        printf("see https://github.com/mbakhoff/unplug for sources\n");
         exit(1);
     }
 
@@ -635,16 +562,10 @@ int main(int argc, char **argv) {
     enable_ip_forward();
 
     try {
-        sparse_file store(calculate_store_size(cfg));
-        mkfs_ext2(store.path);
-        loopback lo(store);
+        workspace ws(cfg);
+        clone_isolated(ws, cfg.isolated_dirs);
 
-        string layer_path = "/tmp/unplug/" + to_string(getpid());
-        mountpoint layer(lo.path, layer_path.c_str(), "ext2");
-
-        clone_isolated(layer, cfg.isolated_dirs);
-
-        run_child(cfg, layer);
+        run_child(cfg, ws);
 
         printf("unplug finished\n");
         return 0;
