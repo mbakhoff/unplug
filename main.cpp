@@ -40,7 +40,7 @@ using std::to_string;
 int exit_signal_caught = 0;
 
 #define dump_error(fn) \
-    printf("%s: %s (%d) #%d\n", fn, strerror(errno), errno, __LINE__);
+    fprintf(stderr, "%s: %s (%d) #%d\n", fn, strerror(errno), errno, __LINE__);
 
 void on_close_signal(int sig) {
     exit_signal_caught = sig;
@@ -233,7 +233,7 @@ struct mountpoint {
     virtual ~mountpoint() {
         //if (umount2(to.c_str(), MNT_DETACH)) {
         if (umount(to.c_str())) {
-            printf("failed to unmount %s\n", to.c_str());
+            fprintf(stderr, "failed to unmount %s\n", to.c_str());
         } else {
             rmdirs(created_dirs);
         }
@@ -422,7 +422,7 @@ struct cpu_cgroup {
 
     virtual ~cpu_cgroup() {
         if (rmdir(dir.c_str()))
-            printf("failed to clean up cgroup\n");
+            fprintf(stderr, "failed to clean up cgroup\n");
     }
 };
 
@@ -577,7 +577,7 @@ void run_child(unplug_config &cfg, mountpoint &layer) {
             printf("container done\n");
             exit(0);
         } catch (const exception &e) {
-            printf("exception in fork: %s\n", e.what());
+            fprintf(stderr, "exception in fork: %s\n", e.what());
             exit(1);
         }
     }
@@ -649,7 +649,7 @@ int main(int argc, char **argv) {
         printf("unplug finished\n");
         return 0;
     } catch (const exception &e) {
-        printf("error: %s\n", e.what());
+        fprintf(stderr, "error: %s\n", e.what());
         return 1;
     }
 }
