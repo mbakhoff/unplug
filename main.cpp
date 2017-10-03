@@ -80,6 +80,7 @@ void mkfs_ext2(const string &path) {
 
 struct unplug_config {
     string runas;
+    uint64_t spare_space;
     vector<string> isolated_dirs;
     vector<string> cmd;
 
@@ -88,6 +89,10 @@ struct unplug_config {
         while (i < argc - 1) {
             if (strstr(argv[i], "-u") == argv[i]) {
                 runas = argv[i + 1];
+                i += 2;
+            }
+            else if (strstr(argv[i], "-s") == argv[i]) {
+                spare_space = std::stoll(argv[i + 1]);
                 i += 2;
             }
             else if (strstr(argv[i], "-d") == argv[i]) {
@@ -571,7 +576,7 @@ void run_child(unplug_config &cfg, mountpoint &layer) {
 
             printf("container done\n");
             exit(0);
-        } catch (exception &e) {
+        } catch (const exception &e) {
             printf("exception in fork: %s\n", e.what());
             exit(1);
         }
@@ -591,17 +596,14 @@ void clone_isolated(mountpoint &layer, vector<string> &sources) {
     }
 }
 
-uint64_t calculate_store_size(const vector<string> dirs) {
+uint64_t calculate_store_size(const unplug_config &cfg) {
     uint64_t total = 0;
-    for (const string &dir : dirs) {
+    for (const string &dir : cfg.isolated_dirs) {
         total += dir_size(dir);
     }
 
-    uint64_t mb128 = 128 * 1024 * 1024;
-    if (total < mb128)
-        return mb128;
-
-    return total * 1.1 + mb128 * 2;
+    uint64_t mb2048 = 2L * 1024L * 1024L * 1024L;
+    return total + (cfg.spare_space > 0 ? cfg.spare_space : mb2048);
 }
 
 void verify_dirs(const vector<string> &dirs) {
@@ -623,7 +625,7 @@ void verify_dirs(const vector<string> &dirs) {
 int main(int argc, char **argv) {
     unplug_config cfg(argc, argv);
     if (cfg.cmd.empty()) {
-        printf("usage: unplug [-u username] [-d abs_path]* <command ...>\n");
+        printf("usage: unplug [-u username] [-s spare_disk_space] [-d abs_path]* <command ...>\n");
         exit(1);
     }
 
@@ -633,7 +635,7 @@ int main(int argc, char **argv) {
     enable_ip_forward();
 
     try {
-        sparse_file store(calculate_store_size(cfg.isolated_dirs));
+        sparse_file store(calculate_store_size(cfg));
         mkfs_ext2(store.path);
         loopback lo(store);
 
