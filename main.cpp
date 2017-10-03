@@ -582,9 +582,6 @@ void run_child(unplug_config &cfg, mountpoint &layer) {
 
 void clone_isolated(mountpoint &layer, vector<string> &sources) {
     for (string &source : sources) {
-        if (source.empty() || source.at(0) != '/') {
-            throw runtime_error("isolated paths must be absolute");
-        }
         string target = layer.to + source;
         string target_parent = target.substr(0, target.find_last_of("/"));
 
@@ -607,12 +604,30 @@ uint64_t calculate_store_size(const vector<string> dirs) {
     return total * 1.1 + mb128 * 2;
 }
 
+void verify_dirs(const vector<string> &dirs) {
+    for (const string &dir : dirs) {
+        if (dir.empty())
+            fail("isolated dir cannot be empty");
+        if (dir.front() != '/')
+            fail("isolated dir must be an absolute path: " + dir);
+        if (is_link(dir))
+            fail("isolated dir must not be a link: " + dir);
+        if (starts_with(dir, "/proc/") || dir.compare("/proc") == 0 ||
+                starts_with(dir, "/sys/") || dir.compare("/sys") == 0 ||
+                starts_with(dir, "/dev/") || dir.compare("/dev") == 0) {
+            fail("isolated dir cannot be in one of /proc /sys /dev: " + dir);
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     unplug_config cfg(argc, argv);
     if (cfg.cmd.empty()) {
         printf("usage: unplug [-u username] [-d abs_path]* <command ...>\n");
         exit(1);
     }
+
+    verify_dirs(cfg.isolated_dirs);
 
     install_signal_handlers();
     enable_ip_forward();

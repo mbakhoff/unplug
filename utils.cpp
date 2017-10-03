@@ -112,6 +112,20 @@ bool is_regular(const string &path) {
     return (s.st_mode & S_IFREG) == S_IFREG;
 }
 
+bool is_link(const string &path) {
+    struct stat s;
+    if (lstat(path.c_str(), &s)) {
+        fail("lstat " + path);
+    }
+    return (s.st_mode & S_IFLNK) == S_IFLNK;
+}
+
+bool starts_with(const string &a, const string &b) {
+    if (a.length() < b.length())
+        return false;
+    return a.substr(0, b.length()).compare(b) == 0;
+}
+
 string ip_to_string(uint32_t ip) {
     in_addr addr;
     addr.s_addr = ip;

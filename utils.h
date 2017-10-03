@@ -23,6 +23,8 @@ void file_write(const string &path, const string &data);
 string file_read_fully(const string &path);
 void exec(std::initializer_list<string> cmd);
 bool is_regular(const string &path);
+bool is_link(const string &path);
+bool starts_with(const string &a, const string &b);
 string ip_to_string(uint32_t ip);
 vector<string> ancestors(const string &path);
 uint64_t dir_size(const string &path);
