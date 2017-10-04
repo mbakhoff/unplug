@@ -1,6 +1,4 @@
 #include <cstring>
-#include <iostream>
-#include <fstream>
 #include <string>
 #include <stdexcept>
 #include <vector>
@@ -10,20 +8,9 @@
 #include <netlink/route/link.h>
 #include <netlink/route/link/veth.h>
 
-#include <arpa/inet.h>
-#include <linux/if.h>
-#include <linux/netlink.h>
-#include <linux/loop.h>
-#include <sys/ioctl.h>
 #include <sys/wait.h>
-#include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/mount.h>
-#include <sys/sysmacros.h>
-#include <sched.h>
-#include <signal.h>
-#include <errno.h>
-#include <fcntl.h>
 #include <unistd.h>
 #include <grp.h>
 #include <pwd.h>
@@ -69,13 +56,6 @@ void clear_signal_handlers() {
 
 void enable_ip_forward() {
     file_write("/proc/sys/net/ipv4/ip_forward", "1");
-}
-
-void mkfs_ext2(const string &path) {
-    if (!is_regular(path)) {
-        throw runtime_error(path + " not a file");
-    }
-    exec({"mkfs.ext2", "-q", path}); // TODO ext4 w/o journal?
 }
 
 struct unplug_config {
@@ -148,14 +128,11 @@ struct workspace {
 
 struct mount_bind {
 
-    vector<string> created_dirs;
     string from, to;
 
     mount_bind(const string &from, const string &to) : from(from), to(to) {
-        mkdirs(to, created_dirs);
         printf("mounting %s to %s\n", from.c_str(), to.c_str());
         if (mount(from.c_str(), to.c_str(), "none", MS_BIND, NULL)) {
-            rmdirs(created_dirs);
             fail("mount from=" + from + " to=" + to);
         }
     }
@@ -163,44 +140,9 @@ struct mount_bind {
     mount_bind(const mount_bind &src) = delete;
 
     virtual ~mount_bind() {
-        //if (umount2(to.c_str(), MNT_DETACH)) {
         if (umount(to.c_str())) {
             fprintf(stderr, "failed to unmount %s\n", to.c_str());
-        } else {
-            rmdirs(created_dirs);
         }
-    }
-
-    void mkdirs(const string &path, vector<string> &created) {
-        if (path.at(0) != '/')
-            throw runtime_error("mountpoint must be absolute path");
-        try {
-            for (string &ancestor : ancestors(path)) {
-                if (mkdir(ancestor.c_str(), 0755)) {
-                    if (errno != EEXIST)
-                        fail("failed to mkdir " + path);
-                } else {
-                    created.push_back(ancestor);
-                }
-            }
-
-            struct stat s;
-            if (stat(path.c_str(), &s) || (s.st_mode & S_IFDIR) != S_IFDIR) {
-                fail(path + " not a directory");
-            }
-        } catch (runtime_error &e) {
-            rmdirs(created);
-            throw e;
-        }
-    }
-
-    int rmdirs(const vector<string> &dirs) {
-        for (auto it = dirs.rbegin(); it != dirs.rend(); ++it) {
-            const string &dir = *it;
-            if (rmdir(dir.c_str()))
-                return -1;
-        }
-        return 0;
     }
 };
 
@@ -228,19 +170,19 @@ struct nl_sock_handle {
 struct veth_pair {
 
     nl_sock_handle &nl_handle;
-    string host, container;
+    string ifname_host, ifname_container;
     pid_t host_pid;
 
     veth_pair(nl_sock_handle &nl_handle) : nl_handle(nl_handle) {
-        host = "up" + to_string(getpid());
-        container = host + "c";
+        ifname_host = "up" + to_string(getpid());
+        ifname_container = ifname_host + "c";
         host_pid = getpid();
 
         rtnl_link *link = rtnl_link_veth_alloc();
-        rtnl_link_set_name(link, host.c_str());
+        rtnl_link_set_name(link, ifname_host.c_str());
 
         rtnl_link *peer = rtnl_link_veth_get_peer(link);
-        rtnl_link_set_name(peer, container.c_str());
+        rtnl_link_set_name(peer, ifname_container.c_str());
 
         int err;
         if ((err = rtnl_link_add(nl_handle.sk, link, NLM_F_CREATE)) < 0) {
@@ -257,11 +199,11 @@ struct veth_pair {
     void configure_host() {
         uint32_t host_raw = (10) | ((host_pid % UINT16_MAX) << 8) | (1 << 24);
         uint32_t subnet_raw = (10) | ((host_pid % UINT16_MAX) << 8);
-        exec({"ip", "address", "add", ip_to_string(host_raw) + "/30", "dev", host});
-        exec({"ip", "link", "set", "dev", host, "up"});
+        exec({"ip", "address", "add", ip_to_string(host_raw) + "/30", "dev", ifname_host});
+        exec({"ip", "link", "set", "dev", ifname_host, "up"});
         exec({"iptables", "-w", "10", "-t", "nat", "-I", "POSTROUTING", "1", "-s", ip_to_string(subnet_raw) + "/30", "-j", "MASQUERADE"});
-        exec({"iptables", "-w", "10", "-I", "FORWARD", "1", "-i", host, "-j", "ACCEPT"});
-        exec({"iptables", "-w", "10", "-I", "FORWARD", "1", "-o", host, "-j", "ACCEPT"});
+        exec({"iptables", "-w", "10", "-I", "FORWARD", "1", "-i", ifname_host, "-j", "ACCEPT"});
+        exec({"iptables", "-w", "10", "-I", "FORWARD", "1", "-o", ifname_host, "-j", "ACCEPT"});
     }
 
     void assign_to_container_ns() {
@@ -269,7 +211,7 @@ struct veth_pair {
 
         rtnl_link *peer;
         // nl_handle is from the original ns -> we can see interfaces from there
-        if ((err = rtnl_link_get_kernel(nl_handle.sk, 0, container.c_str(), &peer)) < 0) {
+        if ((err = rtnl_link_get_kernel(nl_handle.sk, 0, ifname_container.c_str(), &peer)) < 0) {
             nl_perror(err, "Unable to refresh peer");
             throw runtime_error("rtnl_link_get_kernel");
         }
@@ -289,17 +231,17 @@ struct veth_pair {
     void configure_container() {
         uint32_t container_raw = (10) | ((host_pid % UINT16_MAX) << 8) | (2 << 24);
         uint32_t gw_raw = (10) | ((host_pid % UINT16_MAX) << 8) | (1 << 24);
-        exec({"ip", "address", "add", ip_to_string(container_raw) + "/30", "dev", container});
+        exec({"ip", "address", "add", ip_to_string(container_raw) + "/30", "dev", ifname_container});
         exec({"ip", "link", "set", "dev", "lo", "up"});
-        exec({"ip", "link", "set", "dev", container, "up"});
+        exec({"ip", "link", "set", "dev", ifname_container, "up"});
         exec({"ip", "route", "add", "0.0.0.0/0", "via", ip_to_string(gw_raw)});
     }
 
     virtual ~veth_pair() {
         uint32_t subnet_raw = (10) | ((host_pid % UINT16_MAX) << 8);
         try {
-            exec({"iptables", "-w", "10", "-D", "FORWARD", "-i", host, "-j", "ACCEPT"});
-            exec({"iptables", "-w", "10", "-D", "FORWARD", "-o", host, "-j", "ACCEPT"});
+            exec({"iptables", "-w", "10", "-D", "FORWARD", "-i", ifname_host, "-j", "ACCEPT"});
+            exec({"iptables", "-w", "10", "-D", "FORWARD", "-o", ifname_host, "-j", "ACCEPT"});
         } catch (const exception &e) {
             perror(e.what());
         }
@@ -310,7 +252,7 @@ struct veth_pair {
         }
 
         rtnl_link *link = rtnl_link_alloc();
-        rtnl_link_set_name(link, host.c_str());
+        rtnl_link_set_name(link, ifname_host.c_str());
 
         int err;
         if ((err = rtnl_link_delete(nl_handle.sk, link)) < 0) {
@@ -321,10 +263,6 @@ struct veth_pair {
         rtnl_link_put(link);
     }
 };
-
-string gen_cgroup_name() {
-    return "/sys/fs/cgroup/cpu/unplug-" + to_string(getpid());
-}
 
 struct cpu_cgroup {
 
@@ -337,21 +275,20 @@ struct cpu_cgroup {
 
     cpu_cgroup(const cpu_cgroup &src) = delete;
 
+    static string gen_cgroup_name() {
+        return "/sys/fs/cgroup/cpu/unplug-" + to_string(getpid());
+    }
+
     void add_pid(pid_t pid) {
         file_write(dir + "/cgroup.procs", to_string(pid));
     }
 
     vector<pid_t> list() {
-        vector<pid_t> result;
         string procs = file_read_fully(dir + "/cgroup.procs");
-        int offset = 0;
-        while (true) {
-            size_t nl = procs.find_first_of('\n', offset);
-            if (nl == string::npos)
-                break;
-            string pid = procs.substr(offset, nl - offset);
-            result.push_back(std::stoi(pid));
-            offset = nl + 1;
+        vector<pid_t> result;
+        for (const string &pid : split(procs, '\n')) {
+            if (!pid.empty())
+                result.push_back(std::stoi(pid));
         }
         return result;
     }

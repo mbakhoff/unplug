@@ -1,13 +1,9 @@
 #include <cstdio>
 #include <cstring>
-#include <stdexcept>
 
 #include <arpa/inet.h>
-
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <sys/wait.h>
-#include <dirent.h>
 #include <unistd.h>
 
 #include "utils.h"
@@ -104,14 +100,6 @@ void exec(std::initializer_list<string> cmd) {
         throw runtime_error(full_cmd);
 }
 
-bool is_regular(const string &path) {
-    struct stat s;
-    if (stat(path.c_str(), &s)) {
-        fail("stat " + path);
-    }
-    return (s.st_mode & S_IFREG) == S_IFREG;
-}
-
 bool is_link(const string &path) {
     struct stat s;
     if (lstat(path.c_str(), &s)) {
@@ -124,6 +112,19 @@ bool starts_with(const string &a, const string &b) {
     if (a.length() < b.length())
         return false;
     return a.substr(0, b.length()).compare(b) == 0;
+}
+
+vector<string> split(const string &s, char separator) {
+    vector<string> result;
+    int offset = 0;
+    while (true) {
+        size_t sep_pos = s.find_first_of(separator, offset);
+        result.push_back(s.substr(offset, sep_pos - offset));
+        if (sep_pos == string::npos)
+            break;
+        offset = sep_pos + 1;
+    }
+    return result;
 }
 
 string ip_to_string(uint32_t ip) {
@@ -144,50 +145,4 @@ vector<string> ancestors(const string &path) {
         offset = pos + 1;
     }
     return result;
-}
-
-vector<string> list_dir(const string &path) {
-    vector<string> result;
-    DIR *d = opendir(path.c_str());
-    if (!d) {
-        fail("listing " + path);
-    }
-    struct dirent *entry;
-    errno = 0;
-    while ((entry = readdir(d)) != NULL) {
-        if (!strcmp(".", entry->d_name) || !strcmp("..", entry->d_name))
-            continue;
-        result.push_back(entry->d_name);
-    }
-    if (errno != 0) {
-        fail("listing " + path);
-    }
-    closedir(d);
-    return result;
-}
-
-string path_join(const string &a, const string &b) {
-    if (b.front() == '/')
-        return b;
-    return a.back() != '/'
-        ? a + '/' + b
-        : a + b;
-}
-
-uint64_t dir_size(const string &path) {
-    uint64_t total = 0;
-    for (const string &file : list_dir(path)) {
-        string child = path_join(path, file);
-        struct stat s;
-        if (stat(child.c_str(), &s)) {
-            fail("stat " + child);
-        }
-        if ((s.st_mode & S_IFREG) == S_IFREG) {
-            total += s.st_size;
-        }
-        else if ((s.st_mode & S_IFDIR) == S_IFDIR) {
-            total += dir_size(child);
-        }
-    }
-    return total;
 }
