@@ -12,6 +12,9 @@ using std::runtime_error;
 #define fail(message) \
     throw errno_error(message, __FILE__, __LINE__);
 
+#define dump_error(fn) \
+    fprintf(stderr, "%s: %s (%d) #%d\n", fn, strerror(errno), errno, __LINE__);
+
 class errno_error: public runtime_error {
     string what_message;
 public:

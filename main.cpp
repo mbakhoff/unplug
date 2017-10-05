@@ -26,9 +26,6 @@ using std::to_string;
 
 int exit_signal_caught = 0;
 
-#define dump_error(fn) \
-    fprintf(stderr, "%s: %s (%d) #%d\n", fn, strerror(errno), errno, __LINE__);
-
 void on_close_signal(int sig) {
     exit_signal_caught = sig;
 }
@@ -377,7 +374,7 @@ void await_command(pid_t pid, cpu_cgroup &tracked_cgroup) {
     kill_cgroup(tracked_cgroup);
 }
 
-void run_unplugged(unplug_config &cfg, cpu_cgroup &tracked_cgroup) {
+void run_command(unplug_config &cfg, cpu_cgroup &tracked_cgroup) {
     if (exit_signal_caught)
         return;
 
@@ -398,14 +395,17 @@ void run_unplugged(unplug_config &cfg, cpu_cgroup &tracked_cgroup) {
         }
         cmd[argc] = NULL;
 
-        execvp(cmd[0], cmd);
+        if (execvp(cmd[0], cmd)) {
+            dump_error("execvp");
+            exit(1);
+        }
     }
 
     tracked_cgroup.add_pid(pid);
     await_command(pid, tracked_cgroup);
 }
 
-void run_child(unplug_config &cfg, workspace &ws) {
+void run_container(unplug_config &cfg, workspace &ws) {
     if (exit_signal_caught)
         return;
 
@@ -444,7 +444,7 @@ void run_child(unplug_config &cfg, workspace &ws) {
                     string layer_dir = ws.root + isolated;
                     binds.push_back(unique_ptr<mount_bind>(new mount_bind(layer_dir, isolated)));
                 }
-                run_unplugged(cfg, tracked_cgroup);
+                run_command(cfg, tracked_cgroup);
             }
 
             printf("container done\n");
@@ -502,7 +502,7 @@ int main(int argc, char **argv) {
         workspace ws(cfg);
         clone_isolated(ws, cfg.isolated_dirs);
 
-        run_child(cfg, ws);
+        run_container(cfg, ws);
 
         printf("unplug finished\n");
         return 0;

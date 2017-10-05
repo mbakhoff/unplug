@@ -92,7 +92,11 @@ void exec(std::initializer_list<string> cmd) {
         if (false) {
             printf("%s\n", full_cmd.c_str());
         }
-        execvp(ccmd[0], ccmd);
+
+        if (execvp(ccmd[0], ccmd)) {
+            dump_error("execvp");
+            exit(1);
+        }
     }
 
     int stat;
