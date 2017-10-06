@@ -56,14 +56,17 @@ void enable_ip_forward() {
 }
 
 struct unplug_config {
+    bool usage = false;
     string runas;
     string workspace;
+    int host_iface_id = 0;
+    int container_iface_id = 0;
     vector<string> isolated_dirs;
     vector<string> cmd;
 
     unplug_config(int argc, char **argv) {
         int i = 1;
-        while (i < argc - 1) {
+        while (i < argc) {
             if (strstr(argv[i], "-u") == argv[i]) {
                 runas = argv[i + 1];
                 i += 2;
@@ -80,6 +83,19 @@ struct unplug_config {
                     dir.pop_back();
                 isolated_dirs.push_back(dir);
                 i += 2;
+            }
+            else if (strstr(argv[i], "--host-iface-id") == argv[i]) {
+                host_iface_id = std::stoi(argv[i + 1]);
+                i += 2;
+            }
+            else if (strstr(argv[i], "--container-iface-id") == argv[i]) {
+                container_iface_id = std::stoi(argv[i + 1]);
+                i += 2;
+            }
+            else if (strstr(argv[i], "-h") == argv[i] ||
+                     strstr(argv[i], "--help") == argv[i]) {
+                usage = true;
+                i += 1;
             }
             else {
                 break;
@@ -170,16 +186,22 @@ struct veth_pair {
     string ifname_host, ifname_container;
     pid_t host_pid;
 
-    veth_pair(nl_sock_handle &nl_handle) : nl_handle(nl_handle) {
+    veth_pair(nl_sock_handle &nl_handle, unplug_config &cfg) : nl_handle(nl_handle) {
         ifname_host = "up" + to_string(getpid());
         ifname_container = ifname_host + "c";
         host_pid = getpid();
 
         rtnl_link *link = rtnl_link_veth_alloc();
         rtnl_link_set_name(link, ifname_host.c_str());
+        if (cfg.host_iface_id) {
+            rtnl_link_set_ifindex(link, cfg.host_iface_id);
+        }
 
         rtnl_link *peer = rtnl_link_veth_get_peer(link);
         rtnl_link_set_name(peer, ifname_container.c_str());
+        if (cfg.container_iface_id) {
+            rtnl_link_set_ifindex(peer, cfg.container_iface_id);
+        }
 
         int err;
         if ((err = rtnl_link_add(nl_handle.sk, link, NLM_F_CREATE)) < 0) {
@@ -247,17 +269,6 @@ struct veth_pair {
         } catch (const exception &e) {
             perror(e.what());
         }
-
-        rtnl_link *link = rtnl_link_alloc();
-        rtnl_link_set_name(link, ifname_host.c_str());
-
-        int err;
-        if ((err = rtnl_link_delete(nl_handle.sk, link)) < 0) {
-            nl_perror(err, "Unable to delete link");
-            return;
-        }
-
-        rtnl_link_put(link);
     }
 };
 
@@ -410,7 +421,7 @@ void run_container(unplug_config &cfg, workspace &ws) {
         return;
 
     nl_sock_handle nl_handle;
-    veth_pair veth(nl_handle);
+    veth_pair veth(nl_handle, cfg);
     veth.configure_host();
 
     pid_t parent = getpid();
@@ -487,8 +498,15 @@ void verify_dirs(const vector<string> &dirs) {
 
 int main(int argc, char **argv) {
     unplug_config cfg(argc, argv);
-    if (cfg.cmd.empty()) {        
-        printf("usage: unplug [-u username] [-w workspace_abs_path] [-d abs_path]* <command ...>\n");
+    if (cfg.usage || cfg.cmd.empty()) {
+        printf("usage: unplug [options] <command ...>\n");
+        printf("options:\n");
+        printf("  -u <username>\n");
+        printf("  -w <workspace_abs_path>\n");
+        printf("  -d <isolated_dir_abs_path>\n");
+        printf("  --host-iface-id <id>\n");
+        printf("  --container-iface-id <id>\n");
+        printf("\n");
         printf("see https://github.com/mbakhoff/unplug for sources\n");
         exit(1);
     }
