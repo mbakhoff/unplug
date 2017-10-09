@@ -59,6 +59,7 @@ struct unplug_config {
     bool usage = false;
     string runas;
     string workspace;
+    vector<uint32_t> port_forwards;
     vector<string> isolated_dirs;
     vector<string> cmd;
 
@@ -80,6 +81,13 @@ struct unplug_config {
                 while (!dir.empty() && dir.back() == '/')
                     dir.pop_back();
                 isolated_dirs.push_back(dir);
+                i += 2;
+            }
+            else if (strstr(argv[i], "-f") == argv[i]) {
+                long port = std::stol(argv[i + 1]);
+                if (port < 0 || port > UINT32_MAX)
+                    throw runtime_error("port out of range: " + port);
+                port_forwards.push_back((uint32_t) port);
                 i += 2;
             }
             else if (strstr(argv[i], "-h") == argv[i] ||
@@ -173,10 +181,11 @@ struct nl_sock_handle {
 struct veth_pair {
 
     nl_sock_handle &nl_handle;
+    unplug_config &cfg;
     string ifname_host, ifname_container;
     pid_t host_pid;
 
-    veth_pair(nl_sock_handle &nl_handle, unplug_config &cfg) : nl_handle(nl_handle) {
+    veth_pair(nl_sock_handle &nl_handle, unplug_config &cfg) : nl_handle(nl_handle), cfg(cfg) {
         ifname_host = "up" + to_string(getpid());
         ifname_container = ifname_host + "c";
         host_pid = getpid();
@@ -238,6 +247,17 @@ struct veth_pair {
         exec({"ip", "link", "set", "dev", "lo", "up"});
         exec({"ip", "link", "set", "dev", ifname_container, "up"});
         exec({"ip", "route", "add", "0.0.0.0/0", "via", ip_to_string(gw_raw)});
+    }
+
+    void setup_port_forwarding() {
+        if (cfg.port_forwards.empty())
+            return;
+        string host_ip = ip_to_string(((10) | ((host_pid % UINT16_MAX) << 8) | (1 << 24)));
+        file_write("/proc/sys/net/ipv4/conf/all/route_localnet", "1");
+        exec({"iptables", "-w", "10", "-t", "nat", "-A", "POSTROUTING", "-j", "MASQUERADE"});
+        for (uint32_t port : cfg.port_forwards) {
+            exec({"iptables", "-w", "10", "-t", "nat", "-A", "OUTPUT", "-p", "tcp", "--dport", to_string(port), "-j", "DNAT", "--to-destination", host_ip});
+        }
     }
 
     virtual ~veth_pair() {
@@ -425,6 +445,7 @@ void run_container(unplug_config &cfg, workspace &ws) {
 
             veth.assign_to_container_ns();
             veth.configure_container();
+            veth.setup_port_forwarding();
 
             // MS_PRIVATE ensures our overlays don't propagate to the original mount namespace
             if (mount("none", "/", NULL, MS_REC | MS_PRIVATE, NULL)) {
@@ -485,9 +506,10 @@ int main(int argc, char **argv) {
     if (cfg.usage || cfg.cmd.empty()) {
         printf("usage: unplug [options] <command ...>\n");
         printf("options:\n");
-        printf("  -u <username>\n");
-        printf("  -w <workspace_abs_path>\n");
-        printf("  -d <isolated_dir_abs_path>\n");
+        printf("  -u <user>\t - run command as user\n");
+        printf("  -w <path>\t - absolute path of the workspace\n");
+        printf("  -d <path>\t - absolute path of an isolated directory (repeatable)\n");
+        printf("  -f <port>\t - port to forward to host (repeatable)\n");
         printf("\n");
         printf("see https://github.com/mbakhoff/unplug for sources\n");
         exit(1);
