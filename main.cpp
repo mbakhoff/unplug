@@ -59,8 +59,6 @@ struct unplug_config {
     bool usage = false;
     string runas;
     string workspace;
-    int host_iface_id = 0;
-    int container_iface_id = 0;
     vector<string> isolated_dirs;
     vector<string> cmd;
 
@@ -82,14 +80,6 @@ struct unplug_config {
                 while (!dir.empty() && dir.back() == '/')
                     dir.pop_back();
                 isolated_dirs.push_back(dir);
-                i += 2;
-            }
-            else if (strstr(argv[i], "--host-iface-id") == argv[i]) {
-                host_iface_id = std::stoi(argv[i + 1]);
-                i += 2;
-            }
-            else if (strstr(argv[i], "--container-iface-id") == argv[i]) {
-                container_iface_id = std::stoi(argv[i + 1]);
                 i += 2;
             }
             else if (strstr(argv[i], "-h") == argv[i] ||
@@ -193,15 +183,9 @@ struct veth_pair {
 
         rtnl_link *link = rtnl_link_veth_alloc();
         rtnl_link_set_name(link, ifname_host.c_str());
-        if (cfg.host_iface_id) {
-            rtnl_link_set_ifindex(link, cfg.host_iface_id);
-        }
 
         rtnl_link *peer = rtnl_link_veth_get_peer(link);
         rtnl_link_set_name(peer, ifname_container.c_str());
-        if (cfg.container_iface_id) {
-            rtnl_link_set_ifindex(peer, cfg.container_iface_id);
-        }
 
         int err;
         if ((err = rtnl_link_add(nl_handle.sk, link, NLM_F_CREATE | NLM_F_EXCL)) < 0) {
@@ -504,8 +488,6 @@ int main(int argc, char **argv) {
         printf("  -u <username>\n");
         printf("  -w <workspace_abs_path>\n");
         printf("  -d <isolated_dir_abs_path>\n");
-        printf("  --host-iface-id <id>\n");
-        printf("  --container-iface-id <id>\n");
         printf("\n");
         printf("see https://github.com/mbakhoff/unplug for sources\n");
         exit(1);
