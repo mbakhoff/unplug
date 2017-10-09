@@ -204,7 +204,7 @@ struct veth_pair {
         }
 
         int err;
-        if ((err = rtnl_link_add(nl_handle.sk, link, NLM_F_CREATE)) < 0) {
+        if ((err = rtnl_link_add(nl_handle.sk, link, NLM_F_CREATE | NLM_F_EXCL)) < 0) {
                 nl_perror(err, "Unable to add link");
                 throw runtime_error("rtnl_link_add");
         }
