@@ -137,6 +137,14 @@ string ip_to_string(uint32_t ip) {
     return inet_ntoa(addr);
 }
 
+void mkdirs(const string &path) {
+    for (const string &dir : ancestors(path)) {
+        if (mkdir(dir.c_str(), 0755) && errno != EEXIST) {
+            fail("mkdir " + dir);
+        }
+    }
+}
+
 vector<string> ancestors(const string &path) {
     vector<string> result;
     size_t offset = 1;
