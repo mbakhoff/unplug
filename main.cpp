@@ -119,7 +119,11 @@ struct workspace {
         } else {
             root = cfg.workspace + "/" + to_string(getpid());
         }
-        mkdirs(root);
+        for (const string &dir : ancestors(root)) {
+            if (mkdir(dir.c_str(), 0755) && errno != EEXIST) {
+                fail("mkdir " + dir);
+            }
+        }
     }
 
     workspace(const workspace &src) = delete;
@@ -133,39 +137,22 @@ struct workspace {
     }
 };
 
-struct overlay {
+struct mount_bind {
 
-    string target;
-    bool mounted = false;
+    string from, to;
 
-    overlay(workspace &ws, const string &dir): target(dir) {
-        string upperdir = ws.root + "/data" + target;
-        mkdirs(upperdir);
-
-        string workdir = ws.root + "/work" + target;
-        mkdirs(workdir);
-
-        struct stat st_original;
-        if (stat(target.c_str(), &st_original)) {
-            fail("stat " + target);
+    mount_bind(const string &from, const string &to) : from(from), to(to) {
+        printf("mounting %s to %s\n", from.c_str(), to.c_str());
+        if (mount(from.c_str(), to.c_str(), "none", MS_BIND, NULL)) {
+            fail("mount from=" + from + " to=" + to);
         }
-
-        printf("mounting overlay for %s\n", target.c_str());
-        string options = "lowerdir=" + target + ",upperdir=" + upperdir + ",workdir=" + workdir;
-        if (mount("overlay", target.c_str(), "overlay", 0, options.c_str()))
-            fail("overlay " + target);
-        mounted = true;
-
-        // overlayfs brutally changes uid/gid to root. wtf? change it back.
-        if (chown(target.c_str(), st_original.st_uid, st_original.st_gid))
-            fail("chown " + target);
     }
 
-    virtual ~overlay() {
-        if (mounted) {
-            string message = "umount " + target;
-            if (umount(target.c_str()))
-                dump_error(message.c_str());
+    mount_bind(const mount_bind &src) = delete;
+
+    virtual ~mount_bind() {
+        if (umount(to.c_str())) {
+            fprintf(stderr, "failed to unmount %s\n", to.c_str());
         }
     }
 };
@@ -468,9 +455,10 @@ void run_container(unplug_config &cfg, workspace &ws) {
 
             /* scope for destructors */ {
                 cpu_cgroup tracked_cgroup;
-                vector<unique_ptr<overlay>> overlays;
-                for (const string &dir : cfg.isolated_dirs) {
-                    overlays.push_back(unique_ptr<overlay>(new overlay(ws, dir)));
+                vector<unique_ptr<mount_bind>> binds;
+                for (string isolated : cfg.isolated_dirs) {
+                    string layer_dir = ws.root + isolated;
+                    binds.push_back(unique_ptr<mount_bind>(new mount_bind(layer_dir, isolated)));
                 }
                 run_command(cfg, tracked_cgroup);
             }
@@ -484,6 +472,17 @@ void run_container(unplug_config &cfg, workspace &ws) {
     }
 
     await_container(pid);
+}
+
+void clone_isolated(workspace &ws, vector<string> &sources) {
+    for (string &source : sources) {
+        string target = ws.root + source;
+        string target_parent = target.substr(0, target.find_last_of("/"));
+
+        printf("cloning %s -> %s\n", source.c_str(), ws.root.c_str());
+        exec({"mkdir", "-p", target_parent});
+        exec({"cp", "-a", source, target_parent});
+    }
 }
 
 void verify_dirs(const vector<string> &dirs) {
@@ -523,6 +522,7 @@ int main(int argc, char **argv) {
 
     try {
         workspace ws(cfg);
+        clone_isolated(ws, cfg.isolated_dirs);
 
         run_container(cfg, ws);
 
