@@ -406,6 +406,7 @@ void run_command(unplug_config &cfg, cpu_cgroup &tracked_cgroup) {
 
     if (pid == 0) {
         clear_signal_handlers();
+        tracked_cgroup.add_pid(getpid());
 
         if (!cfg.runas.empty() && change_user(cfg.runas))
             exit(1);
@@ -423,7 +424,6 @@ void run_command(unplug_config &cfg, cpu_cgroup &tracked_cgroup) {
         }
     }
 
-    tracked_cgroup.add_pid(pid);
     await_command(pid, tracked_cgroup);
 }
 
