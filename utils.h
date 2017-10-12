@@ -22,6 +22,12 @@ public:
     virtual const char* what() const noexcept;
 };
 
+int await_child_interruptibly(pid_t pid);
+
+void signals_block();
+void signals_unblock();
+bool signals_has_pending();
+
 void file_write(const string &path, const string &data);
 string file_read_fully(const string &path);
 void exec(std::initializer_list<string> cmd);

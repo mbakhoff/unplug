@@ -11,6 +11,50 @@
 using std::runtime_error;
 using std::to_string;
 
+
+int await_child_interruptibly(pid_t pid) {
+    sigset_t set;
+    sigfillset(&set);
+    if (sigwaitinfo(&set, NULL) != SIGCHLD) {
+        kill(pid, SIGTERM);
+    }
+
+    int wstatus = 0;
+    if (waitpid(pid, &wstatus, 0) != pid)
+        fail("waitpid");
+
+    return wstatus;
+}
+
+void signals_block() {
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGTERM);
+    sigaddset(&mask, SIGINT);
+    sigaddset(&mask, SIGHUP);
+    sigaddset(&mask, SIGCHLD);
+    if (sigprocmask(SIG_BLOCK, &mask, NULL)) {
+        fail("sigprocmask");
+    }
+}
+
+void signals_unblock() {
+    sigset_t mask;
+    sigemptyset(&mask);
+    if (sigprocmask(SIG_SETMASK, &mask, NULL)) {
+        fail("sigprocmask");
+    }
+}
+
+bool signals_has_pending() {
+    sigset_t set;
+    sigemptyset(&set);
+    if (sigpending(&set)) {
+        fail("sigprocmask");
+    }
+    return sigisemptyset(&set) == 0;
+}
+
 string strip_dir(const string &path) {
     size_t pos = path.find_last_of('/');
     return pos == string::npos || pos == path.length() ? path : path.substr(pos + 1);
@@ -76,9 +120,10 @@ void exec(std::initializer_list<string> cmd) {
 
     pid_t pid = fork();
     if (pid == -1)
-        fail("fork failed");
+        fail("fork");
 
     if (pid == 0) {
+        signals_unblock();
         fclose(stdin);
 
         int argc = cmd.size();
@@ -99,9 +144,9 @@ void exec(std::initializer_list<string> cmd) {
         }
     }
 
-    int stat;
-    if (waitpid(pid, &stat, 0) != pid || stat != 0)
-        throw runtime_error(full_cmd);
+    int wstatus = await_child_interruptibly(pid);
+    if (!WIFEXITED(wstatus) || WEXITSTATUS(wstatus) != 0)
+        throw runtime_error("exec failed: " + full_cmd);
 }
 
 bool is_link(const string &path) {
