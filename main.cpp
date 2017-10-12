@@ -124,6 +124,13 @@ struct workspace {
                 fail("mkdir " + dir);
             }
         }
+        if (!cfg.runas.empty()) {
+            struct passwd *pw = getpwnam(cfg.runas.c_str());
+            if (pw == NULL)
+                fail("no such user: " + cfg.runas);
+            if (chown(root.c_str(), pw->pw_uid, pw->pw_gid))
+                fail("chown workspace");
+        }
     }
 
     workspace(const workspace &src) = delete;
