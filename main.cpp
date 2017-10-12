@@ -513,17 +513,21 @@ void verify_dirs(const vector<string> &dirs) {
     }
 }
 
+void usage() {
+    printf("usage: unplug [options] <command ...>\n");
+    printf("options:\n");
+    printf("  -u <user>\t - run command as user\n");
+    printf("  -w <path>\t - absolute path of the workspace\n");
+    printf("  -d <path>\t - absolute path of an isolated directory (repeatable)\n");
+    printf("  -f <port>\t - port to forward to host (repeatable)\n");
+    printf("\n");
+    printf("see https://github.com/mbakhoff/unplug for sources\n");
+}
+
 int main(int argc, char **argv) {
     unplug_config cfg(argc, argv);
     if (cfg.usage || cfg.cmd.empty()) {
-        printf("usage: unplug [options] <command ...>\n");
-        printf("options:\n");
-        printf("  -u <user>\t - run command as user\n");
-        printf("  -w <path>\t - absolute path of the workspace\n");
-        printf("  -d <path>\t - absolute path of an isolated directory (repeatable)\n");
-        printf("  -f <port>\t - port to forward to host (repeatable)\n");
-        printf("\n");
-        printf("see https://github.com/mbakhoff/unplug for sources\n");
+        usage();
         exit(1);
     }
 
