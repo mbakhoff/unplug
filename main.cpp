@@ -445,20 +445,25 @@ void run_container(unplug_config &cfg, workspace &ws) {
         setenv("UNPLUG_PID", pid_str.c_str(), 1);
 
         try {
-            if (unshare(CLONE_NEWNS | CLONE_NEWNET)) {
-                perror("unshare failed");
+            if (unshare(CLONE_NEWNET)) {
+                perror("CLONE_NEWNET failed");
                 exit(1);
+            }
+            if (!cfg.isolated_dirs.empty()) {
+                if (unshare(CLONE_NEWNS)) {
+                    perror("CLONE_NEWNS failed");
+                    exit(1);
+                }
+                // MS_PRIVATE ensures our overlays don't propagate to the original mount namespace
+                if (mount("none", "/", NULL, MS_REC | MS_PRIVATE, NULL)) {
+                    perror("failed to mount root private");
+                    exit(1);
+                }
             }
 
             veth.assign_to_container_ns();
             veth.configure_container();
             veth.setup_port_forwarding();
-
-            // MS_PRIVATE ensures our overlays don't propagate to the original mount namespace
-            if (mount("none", "/", NULL, MS_REC | MS_PRIVATE, NULL)) {
-                perror("failed to mount root private");
-                exit(1);
-            }
 
             /* scope for destructors */ {
                 cpu_cgroup tracked_cgroup;
