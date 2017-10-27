@@ -345,38 +345,48 @@ int await_command(pid_t pid, cpu_cgroup &tracked_cgroup) {
 }
 
 int run_command(unplug_config &cfg, cpu_cgroup &tracked_cgroup) {
-    if (signals_has_pending())
+    if (signals_drain())
         return 1;
+
+    pipe_latch latch;
 
     pid_t pid = fork();
     if (pid == -1)
         fail("fork");
 
     if (pid == 0) {
-        tracked_cgroup.add_pid(getpid());
-        signals_unblock();
+        try {
+            tracked_cgroup.add_pid(getpid());
+            signals_unblock();
+            latch.release();
 
-        if (!cfg.runas.empty() && change_user(cfg.runas))
-            exit(1);
+            if (!cfg.runas.empty() && change_user(cfg.runas))
+                exit(1);
 
-        int argc = cfg.cmd.size();
-        char *cmd[argc + 1];
-        for (int i = 0; i < argc; i++) {
-            cmd[i] = strdup(cfg.cmd[i].c_str());
-        }
-        cmd[argc] = NULL;
+            int argc = cfg.cmd.size();
+            char *cmd[argc + 1];
+            for (int i = 0; i < argc; i++) {
+                cmd[i] = strdup(cfg.cmd[i].c_str());
+            }
+            cmd[argc] = NULL;
 
-        if (execvp(cmd[0], cmd)) {
-            dump_error("execvp");
+            if (execvp(cmd[0], cmd)) {
+                dump_error("execvp");
+                exit(1);
+            }
+        } catch (const exception &e) {
+            fprintf(stderr, "FATAL (run_command): %s\n", e.what());
             exit(1);
         }
     }
+
+    latch.await();
 
     return await_command(pid, tracked_cgroup);
 }
 
 int run_container(unplug_config &cfg, workspace &ws) {
-    if (signals_has_pending())
+    if (signals_drain())
         return 1;
 
     nl_sock_handle nl_handle;
@@ -389,10 +399,10 @@ int run_container(unplug_config &cfg, workspace &ws) {
         fail("fork");
 
     if (pid == 0) {
-        string pid_str = to_string(parent);
-        setenv("UNPLUG_PID", pid_str.c_str(), 1);
-
         try {
+            string pid_str = to_string(parent);
+            setenv("UNPLUG_PID", pid_str.c_str(), 1);
+
             if (unshare(CLONE_NEWNET)) {
                 perror("CLONE_NEWNET failed");
                 exit(1);
@@ -443,7 +453,7 @@ void clone_isolated(workspace &ws, vector<string> &sources) {
 
         printf("cloning %s -> %s\n", source.c_str(), ws.root.c_str());
         exec({"mkdir", "-p", target_parent});
-        exec({"cp", "-a", source, target_parent});
+        exec_interruptibly({"cp", "-a", source, target_parent});
     }
 }
 

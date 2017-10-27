@@ -12,10 +12,20 @@ using std::runtime_error;
 using std::to_string;
 
 
+int await_child(pid_t pid) {
+    int wstatus = 0;
+    if (waitpid(pid, &wstatus, 0) != pid)
+        fail("waitpid");
+
+    signals_drain_one(SIGCHLD);
+    return wstatus;
+}
+
 int await_child_interruptibly(pid_t pid) {
     sigset_t set;
     sigfillset(&set);
     if (sigwaitinfo(&set, NULL) != SIGCHLD) {
+        fprintf(stderr, "caught signal, terminating child\n");
         kill(pid, SIGTERM);
     }
 
@@ -46,13 +56,33 @@ void signals_unblock() {
     }
 }
 
-bool signals_has_pending() {
+bool signals_drain_set(sigset_t *set) {
+    timespec ts;
+    ts.tv_sec = ts.tv_nsec = 0;
+
+    bool any_cleared = false;
+    while (sigtimedwait(set, NULL, &ts) != -1) {
+        any_cleared = true;
+    }
+    if (errno != EAGAIN) {
+        fail("sigtimedwait");
+    }
+    errno = 0;
+
+    return any_cleared;
+}
+
+bool signals_drain() {
+    sigset_t set;
+    sigfillset(&set);
+    return signals_drain_set(&set);
+}
+
+bool signals_drain_one(int signo) {
     sigset_t set;
     sigemptyset(&set);
-    if (sigpending(&set)) {
-        fail("sigprocmask");
-    }
-    return sigisemptyset(&set) == 0;
+    sigaddset(&set, signo);
+    return signals_drain_set(&set);
 }
 
 string strip_dir(const string &path) {
@@ -111,42 +141,82 @@ string file_read_fully(const string &path) {
     return result;
 }
 
-void exec(std::initializer_list<string> cmd) {
+pipe_latch::pipe_latch() {
+    if (pipe(pipefd) == -1)
+        fail("pipe");
+}
+
+void pipe_latch::release() {
+    char buf = 1;
+    if (write(pipefd[1], &buf, sizeof(buf)) != sizeof(buf))
+        fail("latch release");
+    close(pipefd[0]);
+    close(pipefd[1]);
+}
+
+void pipe_latch::await() {
+    char buf = 0;
+    if (read(pipefd[0], &buf, sizeof(buf)) != sizeof(buf))
+        fail("latch await");
+    close(pipefd[0]);
+    close(pipefd[1]);
+}
+
+void do_exec(bool interruptible, std::initializer_list<string> cmd) {
     string full_cmd;
     for (const string &s : cmd) {
         full_cmd += s;
         full_cmd += " ";
     }
 
+    pipe_latch latch;
+
     pid_t pid = fork();
     if (pid == -1)
         fail("fork");
 
     if (pid == 0) {
-        signals_unblock();
-        fclose(stdin);
+        try {
+            signals_unblock();
+            fclose(stdin);
 
-        int argc = cmd.size();
-        char *ccmd[argc + 1];
-        int i = 0;
-        for (const string &s : cmd) {
-            ccmd[i++] = strdup(s.c_str());
-        }
-        ccmd[argc] = NULL;
+            latch.release();
 
-        if (false) {
-            printf("%s\n", full_cmd.c_str());
-        }
+            int argc = cmd.size();
+            char *ccmd[argc + 1];
+            int i = 0;
+            for (const string &s : cmd) {
+                ccmd[i++] = strdup(s.c_str());
+            }
+            ccmd[argc] = NULL;
 
-        if (execvp(ccmd[0], ccmd)) {
-            dump_error("execvp");
+            if (execvp(ccmd[0], ccmd)) {
+                dump_error("execvp");
+                exit(1);
+            }
+        } catch (const std::exception &e) {
+            fprintf(stderr, "FATAL (do_exec): %s\n", e.what());
             exit(1);
         }
     }
 
-    int wstatus = await_child_interruptibly(pid);
+    latch.await();
+
+    int wstatus = interruptible
+            ? await_child_interruptibly(pid)
+            : await_child(pid);
     if (!WIFEXITED(wstatus) || WEXITSTATUS(wstatus) != 0)
         throw runtime_error("exec failed: " + full_cmd);
+}
+
+void exec(std::initializer_list<string> cmd) {
+    do_exec(false, cmd);
+}
+
+void exec_interruptibly(std::initializer_list<string> cmd) {
+    if (signals_drain())
+        fail("signal");
+    do_exec(true, cmd);
 }
 
 bool is_link(const string &path) {

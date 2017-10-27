@@ -22,15 +22,24 @@ public:
     virtual const char* what() const noexcept;
 };
 
+struct pipe_latch {
+    int pipefd[2];
+    pipe_latch();
+    void release();
+    void await();
+};
+
 int await_child_interruptibly(pid_t pid);
 
 void signals_block();
 void signals_unblock();
-bool signals_has_pending();
+bool signals_drain();
+bool signals_drain_one(int signo);
 
 void file_write(const string &path, const string &data);
 string file_read_fully(const string &path);
 void exec(std::initializer_list<string> cmd);
+void exec_interruptibly(std::initializer_list<string> cmd);
 bool is_link(const string &path);
 bool starts_with(const string &a, const string &b);
 vector<string> split(const string &s, char separator);
