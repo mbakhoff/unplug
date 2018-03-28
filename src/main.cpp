@@ -313,34 +313,41 @@ int change_user(const string &user) {
     return 0;
 }
 
-void kill_cgroup(cpu_cgroup &tracked_cgroup) {
-    for (int ttl = 15; ttl >= 0; ttl--) {
-        vector<pid_t> descendants = tracked_cgroup.list();
-        if (tracked_cgroup.list().empty()) {
-            break;
-        }
-
-        int sig = ttl > 0 ? SIGTERM : SIGKILL;
-        for (pid_t descendant : descendants) {
-            printf("kill -%d %d\n", sig, descendant);
-            kill(descendant, sig);
-        }
-        sleep(1);
-    }
-}
-
 int await_command(pid_t pid, cpu_cgroup &tracked_cgroup) {
     sigset_t set;
     sigfillset(&set);
     int signal = sigwaitinfo(&set, NULL);
 
     printf("container caught %d, terminating command cgroup\n", signal);
-    kill_cgroup(tracked_cgroup);
+
+    // ask nicely
+    for (pid_t descendant : tracked_cgroup.list()) {
+        printf("kill -%d %d\n", SIGTERM, descendant);
+        kill(descendant, SIGTERM);
+    }
+    for (int ticks = 0; ticks < 15; ticks++) {
+        if (tracked_cgroup.list().empty()) {
+            break;
+        }
+        sleep(1);
+    }
+
+    // kill everyone
+    for (pid_t descendant : tracked_cgroup.list()) {
+        printf("kill -%d %d\n", SIGKILL, descendant);
+        kill(descendant, SIGKILL);
+    }
+    for (int ticks = 0; ticks < 3; ticks++) {
+        if (tracked_cgroup.list().empty()) {
+            break;
+        }
+        sleep(1);
+    }
 
     int wstatus = 0;
-    if (waitpid(pid, &wstatus, 0) != pid)
+    if (waitpid(pid, &wstatus, 0) != pid) {
         fail("waitpid");
-
+    }
     return wstatus;
 }
 
