@@ -60,7 +60,7 @@ struct unplug_config {
             else if (strstr(argv[i], "-f") == argv[i]) {
                 long port = std::stol(argv[i + 1]);
                 if (port < 0 || port > UINT32_MAX)
-                    throw runtime_error("port out of range: " + port);
+                    throw runtime_error("port out of range: " + to_string(port));
                 port_forwards.push_back((uint32_t) port);
                 i += 2;
             }
