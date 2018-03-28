@@ -280,7 +280,7 @@ struct cpu_cgroup {
     }
 
     virtual ~cpu_cgroup() {
-        if (rmdir(dir.c_str()))
+        if (rmdir(dir.c_str()) && errno != ENOENT)
             fprintf(stderr, "failed to clean up cgroup\n");
     }
 };
