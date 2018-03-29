@@ -33,6 +33,7 @@ struct unplug_config {
     bool usage = false;
     string runas;
     string workspace;
+    string pidfile;
     vector<uint32_t> port_forwards;
     vector<string> isolated_dirs;
     vector<string> cmd;
@@ -42,6 +43,10 @@ struct unplug_config {
         while (i < argc) {
             if (strstr(argv[i], "-u") == argv[i]) {
                 runas = argv[i + 1];
+                i += 2;
+            }
+            else if (strstr(argv[i], "-p") == argv[i]) {
+                pidfile = argv[i + 1];
                 i += 2;
             }
             else if (strstr(argv[i], "-w") == argv[i]) {
@@ -77,6 +82,19 @@ struct unplug_config {
         while (i < argc) {
             cmd.push_back(argv[i++]);
         }
+    }
+};
+
+struct pidfile {
+
+    string path;
+
+    pidfile(const string &path): path(path) {
+        file_write(path, to_string(getpid()));
+    }
+
+    virtual ~pidfile() {
+        unlink(path.c_str());
     }
 };
 
@@ -483,10 +501,11 @@ void verify_dirs(const vector<string> &dirs) {
 void usage() {
     printf("usage: unplug [options] <command ...>\n");
     printf("options:\n");
-    printf("  -u <user>\t - run command as user\n");
-    printf("  -w <path>\t - absolute path of the workspace\n");
-    printf("  -d <path>\t - absolute path of an isolated directory (repeatable)\n");
-    printf("  -f <port>\t - port to forward to host (repeatable)\n");
+    printf("  -u <user>  - run command as user\n");
+    printf("  -p <path>  - write unplug pid to file\n");
+    printf("  -w <path>  - absolute path of the workspace\n");
+    printf("  -d <path>  - absolute path of an isolated directory (repeatable)\n");
+    printf("  -f <port>  - port to forward to host (repeatable)\n");
     printf("\n");
     printf("see https://github.com/mbakhoff/unplug for sources\n");
 }
@@ -502,6 +521,12 @@ int main(int argc, char **argv) {
 
     try {
         signals_block();
+
+        unique_ptr<pidfile> pf;
+        if (!cfg.pidfile.empty()) {
+            pf.reset(new pidfile(cfg.pidfile));
+        }
+
         verify_dirs(cfg.isolated_dirs);
         enable_ip_forward();
 
