@@ -492,6 +492,8 @@ void usage() {
 }
 
 int main(int argc, char **argv) {
+    setlinebuf(stdout);
+
     unplug_config cfg(argc, argv);
     if (cfg.usage || cfg.cmd.empty()) {
         usage();
