@@ -19,7 +19,7 @@
 
 using std::string;
 using std::vector;
-using std::unique_ptr;
+using std::shared_ptr;
 using std::exception;
 using std::runtime_error;
 using std::to_string;
@@ -103,14 +103,7 @@ struct workspace {
     string root;
 
     workspace(const unplug_config &cfg) {
-        if (cfg.workspace.empty()) {
-            char *envhome = getenv("HOME");
-            if (envhome == NULL)
-                fail("workspace not configured and HOME not set");
-            root = string() + envhome + "/.unplug/" + to_string(getpid());
-        } else {
-            root = cfg.workspace + "/" + to_string(getpid());
-        }
+        root = get_root(cfg);
         for (const string &dir : ancestors(root)) {
             if (mkdir(dir.c_str(), 0755) && errno != EEXIST) {
                 fail("mkdir " + dir);
@@ -119,6 +112,22 @@ struct workspace {
     }
 
     workspace(const workspace &src) = delete;
+
+    static string get_root(const unplug_config &cfg) {
+      if (cfg.workspace.empty()) {
+          char *envhome = getenv("HOME");
+          if (envhome == NULL)
+              fail("workspace not configured and HOME not set");
+          return string() + envhome + "/.unplug/" + to_string(getpid());
+      } else {
+          return cfg.workspace + "/" + to_string(getpid());
+      }
+    }
+
+    static void cleanup(const unplug_config &cfg) {
+      string root = get_root(cfg);
+      exec({"rm", "-rf", root});
+    }
 
     virtual ~workspace() {
         try {
@@ -272,15 +281,15 @@ struct cpu_cgroup {
 
     string dir;
 
-    cpu_cgroup(): dir(gen_cgroup_name()) {
-        if (mkdir(dir.c_str(), 0755))
+    cpu_cgroup(pid_t pid): dir(gen_cgroup_name(pid)) {
+        if (mkdir(dir.c_str(), 0755) && errno != EEXIST)
             fail("mkdir " + dir);
     }
 
     cpu_cgroup(const cpu_cgroup &src) = delete;
 
-    static string gen_cgroup_name() {
-        return "/sys/fs/cgroup/cpu/unplug-" + to_string(getpid());
+    static string gen_cgroup_name(pid_t pid) {
+        return "/sys/fs/cgroup/cpu/unplug-" + to_string(pid);
     }
 
     void add_pid(pid_t pid) {
@@ -418,14 +427,14 @@ int run_container(unplug_config &cfg, workspace &ws) {
     veth_pair veth(nl_handle, cfg);
     veth.configure_host();
 
-    pid_t parent = getpid();
+    pid_t parent_pid = getpid();
     pid_t pid = fork();
     if (pid == -1)
         fail("fork");
 
     if (pid == 0) {
         try {
-            string pid_str = to_string(parent);
+            string pid_str = to_string(parent_pid);
             setenv("UNPLUG_PID", pid_str.c_str(), 1);
 
             if (unshare(CLONE_NEWNET)) {
@@ -450,11 +459,11 @@ int run_container(unplug_config &cfg, workspace &ws) {
 
             int exit_code = 1;
             /* scope for destructors */ {
-                cpu_cgroup tracked_cgroup;
-                vector<unique_ptr<mount_bind>> binds;
+                cpu_cgroup tracked_cgroup(parent_pid);
+                vector<shared_ptr<mount_bind>> binds;
                 for (string isolated : cfg.isolated_dirs) {
                     string layer_dir = ws.root + isolated;
-                    binds.push_back(unique_ptr<mount_bind>(new mount_bind(layer_dir, isolated)));
+                    binds.push_back(shared_ptr<mount_bind>(new mount_bind(layer_dir, isolated)));
                 }
                 int wstatus = run_command(cfg, tracked_cgroup);
                 exit_code = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : 1;
@@ -522,7 +531,9 @@ int main(int argc, char **argv) {
     try {
         signals_block();
 
-        unique_ptr<pidfile> pf;
+        workspace::cleanup(cfg);
+
+        shared_ptr<pidfile> pf;
         if (!cfg.pidfile.empty()) {
             pf.reset(new pidfile(cfg.pidfile));
         }
