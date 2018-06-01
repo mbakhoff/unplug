@@ -209,6 +209,27 @@ struct veth_pair {
 
     veth_pair(const veth_pair &src) = delete;
 
+    static void cleanup() {
+      nl_sock_handle nl_handle;
+
+      string ifname_host = "up" + to_string(getpid());
+      cleanup(nl_handle.sk, ifname_host);
+
+      string ifname_container = ifname_host + "c";
+      cleanup(nl_handle.sk, ifname_container);
+    }
+
+    static void cleanup(nl_sock *nl_handle, const string &name) {
+      rtnl_link *link;
+      if (!rtnl_link_get_kernel(nl_handle, 0, name.c_str(), &link)) {
+        int err;
+        if ((err = rtnl_link_delete(nl_handle, link)) != 0) {
+          nl_perror(err, "Unable to cleanup link");
+        }
+        rtnl_link_put(link);
+      }
+    }
+
     void configure_host() {
         uint32_t host_raw = (10) | ((host_pid % UINT16_MAX) << 8) | (1 << 24);
         uint32_t subnet_raw = (10) | ((host_pid % UINT16_MAX) << 8);
@@ -532,6 +553,7 @@ int main(int argc, char **argv) {
         signals_block();
 
         workspace::cleanup(cfg);
+        veth_pair::cleanup();
 
         shared_ptr<pidfile> pf;
         if (!cfg.pidfile.empty()) {
