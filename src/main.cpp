@@ -205,6 +205,8 @@ struct veth_pair {
 
         rtnl_link_put(link);
         rtnl_link_put(peer);
+
+        printf("unplug: exposing container at %s\n", container_ip().c_str());
     }
 
     veth_pair(const veth_pair &src) = delete;
@@ -230,12 +232,25 @@ struct veth_pair {
       }
     }
 
+    string host_ip() const {
+      uint32_t host_raw = (10) | ((host_pid % UINT16_MAX) << 8) | (1 << 24);
+      return ip_to_string(host_raw);
+    }
+
+    string container_ip() const {
+      uint32_t container_raw = (10) | ((host_pid % UINT16_MAX) << 8) | (2 << 24);
+      return ip_to_string(container_raw);
+    }
+
+    string subnet() const {
+      uint32_t subnet_raw = (10) | ((host_pid % UINT16_MAX) << 8);
+      return ip_to_string(subnet_raw);
+    }
+
     void configure_host() {
-        uint32_t host_raw = (10) | ((host_pid % UINT16_MAX) << 8) | (1 << 24);
-        uint32_t subnet_raw = (10) | ((host_pid % UINT16_MAX) << 8);
-        exec({"ip", "address", "add", ip_to_string(host_raw) + "/30", "dev", ifname_host});
+        exec({"ip", "address", "add", host_ip() + "/30", "dev", ifname_host});
         exec({"ip", "link", "set", "dev", ifname_host, "up"});
-        exec({"iptables", "-w", "10", "-t", "nat", "-I", "POSTROUTING", "1", "-s", ip_to_string(subnet_raw) + "/30", "-j", "MASQUERADE"});
+        exec({"iptables", "-w", "10", "-t", "nat", "-I", "POSTROUTING", "1", "-s", subnet() + "/30", "-j", "MASQUERADE"});
         exec({"iptables", "-w", "10", "-I", "FORWARD", "1", "-i", ifname_host, "-j", "ACCEPT"});
         exec({"iptables", "-w", "10", "-I", "FORWARD", "1", "-o", ifname_host, "-j", "ACCEPT"});
     }
@@ -263,12 +278,10 @@ struct veth_pair {
     }
 
     void configure_container() {
-        uint32_t container_raw = (10) | ((host_pid % UINT16_MAX) << 8) | (2 << 24);
-        uint32_t gw_raw = (10) | ((host_pid % UINT16_MAX) << 8) | (1 << 24);
-        exec({"ip", "address", "add", ip_to_string(container_raw) + "/30", "dev", ifname_container});
+        exec({"ip", "address", "add", container_ip() + "/30", "dev", ifname_container});
         exec({"ip", "link", "set", "dev", "lo", "up"});
         exec({"ip", "link", "set", "dev", ifname_container, "up"});
-        exec({"ip", "route", "add", "0.0.0.0/0", "via", ip_to_string(gw_raw)});
+        exec({"ip", "route", "add", "0.0.0.0/0", "via", host_ip()});
     }
 
     void setup_port_forwarding() {
