@@ -12,6 +12,16 @@ using std::runtime_error;
 using std::to_string;
 
 
+string join_path(const string &a, const string &b) {
+    string a2 = a;
+    while (a2.back() == '/')
+        a2 = a2.substr(0, a2.length() - 1);
+    string b2 = b;
+    while (b2.front() == '/')
+        b2 = b2.substr(1);
+    return a2 + '/' + b2;
+}
+
 int await_child(pid_t pid) {
     int wstatus = 0;
     if (waitpid(pid, &wstatus, 0) != pid)
@@ -162,7 +172,7 @@ void pipe_latch::await() {
     close(pipefd[1]);
 }
 
-void do_exec(bool interruptible, std::initializer_list<string> cmd) {
+void exec(std::initializer_list<string> cmd) {
     string full_cmd;
     for (const string &s : cmd) {
         full_cmd += s;
@@ -202,21 +212,9 @@ void do_exec(bool interruptible, std::initializer_list<string> cmd) {
 
     latch.await();
 
-    int wstatus = interruptible
-            ? await_child_interruptibly(pid)
-            : await_child(pid);
+    int wstatus = await_child(pid);
     if (!WIFEXITED(wstatus) || WEXITSTATUS(wstatus) != 0)
         throw runtime_error("exec failed: " + full_cmd);
-}
-
-void exec(std::initializer_list<string> cmd) {
-    do_exec(false, cmd);
-}
-
-void exec_interruptibly(std::initializer_list<string> cmd) {
-    if (signals_drain())
-        fail("signal");
-    do_exec(true, cmd);
 }
 
 bool is_link(const string &path) {
