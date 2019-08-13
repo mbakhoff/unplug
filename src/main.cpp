@@ -144,9 +144,20 @@ struct mounted_overlay {
 
     mounted_overlay(const string &dir, const string &overlay, const string &work) : dir(dir) {
         printf("mounting overlay %s\n", dir.c_str());
+
+        struct stat s;
+        if (lstat(dir.c_str(), &s) || (s.st_mode & S_IFDIR) != S_IFDIR) {
+            fail("stat " + dir);
+        }
+
         string opts = "lowerdir=" + dir + ",upperdir=" + overlay + ",workdir=" + work;
         if (mount("unplug", dir.c_str(), "overlay", 0, opts.c_str())) {
             fail("mount overlay " + dir + " opts " + opts);
+        }
+
+        // mounting the overlay changes the owner to root:root. restore the old owner
+        if (lchown(dir.c_str(), s.st_uid, s.st_gid)) {
+            fail("chown overlay " + dir);
         }
     }
 
