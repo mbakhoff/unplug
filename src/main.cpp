@@ -80,7 +80,7 @@ struct unplug_config {
         }
 
         while (i < argc) {
-            cmd.push_back(argv[i++]);
+            cmd.emplace_back(argv[i++]);
         }
     }
 };
@@ -116,7 +116,7 @@ struct workspace {
     static string get_root(const unplug_config &cfg) {
       if (cfg.workspace.empty()) {
           char *envhome = getenv("HOME");
-          if (envhome == NULL)
+          if (envhome == nullptr)
               fail("workspace not configured and HOME not set");
           return string() + envhome + "/.unplug/" + to_string(getpid());
       } else {
@@ -144,7 +144,7 @@ struct mount_bind {
 
     mount_bind(const string &from, const string &to) : from(from), to(to) {
         printf("mounting %s to %s\n", from.c_str(), to.c_str());
-        if (mount(from.c_str(), to.c_str(), "none", MS_BIND, NULL)) {
+        if (mount(from.c_str(), to.c_str(), "none", MS_BIND, nullptr)) {
             fail("mount from=" + from + " to=" + to);
         }
     }
@@ -348,7 +348,7 @@ struct cpu_cgroup {
 
 int change_user(const string &user) {
     struct passwd *pw = getpwnam(user.c_str());
-    if (pw == NULL) {
+    if (pw == nullptr) {
         perror("user not found");
         return -1;
     }
@@ -377,7 +377,7 @@ int change_user(const string &user) {
 int await_command(pid_t pid, cpu_cgroup &tracked_cgroup) {
     sigset_t set;
     sigfillset(&set);
-    int signal = sigwaitinfo(&set, NULL);
+    int signal = sigwaitinfo(&set, nullptr);
 
     printf("container caught %d, terminating command cgroup\n", signal);
 
@@ -436,7 +436,7 @@ int run_command(unplug_config &cfg, cpu_cgroup &tracked_cgroup) {
             for (int i = 0; i < argc; i++) {
                 cmd[i] = strdup(cfg.cmd[i].c_str());
             }
-            cmd[argc] = NULL;
+            cmd[argc] = nullptr;
 
             if (execvp(cmd[0], cmd)) {
                 dump_error("execvp");
@@ -481,7 +481,7 @@ int run_container(unplug_config &cfg, workspace &ws) {
                     exit(1);
                 }
                 // MS_PRIVATE ensures our overlays don't propagate to the original mount namespace
-                if (mount("none", "/", NULL, MS_REC | MS_PRIVATE, NULL)) {
+                if (mount("none", "/", nullptr, MS_REC | MS_PRIVATE, nullptr)) {
                     perror("failed to mount root private");
                     exit(1);
                 }
@@ -491,11 +491,11 @@ int run_container(unplug_config &cfg, workspace &ws) {
             veth.configure_container();
             veth.setup_port_forwarding();
 
-            int exit_code = 1;
+            int exit_code;
             /* scope for destructors */ {
                 cpu_cgroup tracked_cgroup(parent_pid);
                 vector<shared_ptr<mount_bind>> binds;
-                for (string isolated : cfg.isolated_dirs) {
+                for (const string &isolated : cfg.isolated_dirs) {
                     string layer_dir = ws.root + isolated;
                     binds.push_back(shared_ptr<mount_bind>(new mount_bind(layer_dir, isolated)));
                 }
@@ -517,7 +517,7 @@ int run_container(unplug_config &cfg, workspace &ws) {
 void clone_isolated(workspace &ws, vector<string> &sources) {
     for (string &source : sources) {
         string target = ws.root + source;
-        string target_parent = target.substr(0, target.find_last_of("/"));
+        string target_parent = target.substr(0, target.find_last_of('/'));
 
         printf("cloning %s -> %s\n", source.c_str(), ws.root.c_str());
         exec({"mkdir", "-p", target_parent});
@@ -533,9 +533,9 @@ void verify_dirs(const vector<string> &dirs) {
             fail("isolated dir must be an absolute path: " + dir);
         if (is_link(dir))
             fail("isolated dir must not be a link: " + dir);
-        if (starts_with(dir, "/proc/") || dir.compare("/proc") == 0 ||
-                starts_with(dir, "/sys/") || dir.compare("/sys") == 0 ||
-                starts_with(dir, "/dev/") || dir.compare("/dev") == 0) {
+        if (starts_with(dir, "/proc/") || dir == "/proc" ||
+                starts_with(dir, "/sys/") || dir == "/sys" ||
+                starts_with(dir, "/dev/") || dir == "/dev") {
             fail("isolated dir cannot be in one of /proc /sys /dev: " + dir);
         }
     }
