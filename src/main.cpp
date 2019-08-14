@@ -138,34 +138,22 @@ struct workspace {
     }
 };
 
-struct mounted_overlay {
+struct mount_bind {
 
-    string dir;
+    string from, to;
 
-    mounted_overlay(const string &dir, const string &overlay, const string &work) : dir(dir) {
-        printf("mounting overlay %s\n", dir.c_str());
-
-        struct stat s;
-        if (lstat(dir.c_str(), &s) || (s.st_mode & S_IFDIR) != S_IFDIR) {
-            fail("stat " + dir);
-        }
-
-        string opts = "lowerdir=" + dir + ",upperdir=" + overlay + ",workdir=" + work;
-        if (mount("unplug", dir.c_str(), "overlay", 0, opts.c_str())) {
-            fail("mount overlay " + dir + " opts " + opts);
-        }
-
-        // mounting the overlay changes the owner to root:root. restore the old owner
-        if (lchown(dir.c_str(), s.st_uid, s.st_gid)) {
-            fail("chown overlay " + dir);
+    mount_bind(const string &from, const string &to) : from(from), to(to) {
+        printf("mounting %s to %s\n", from.c_str(), to.c_str());
+        if (mount(from.c_str(), to.c_str(), "none", MS_BIND, nullptr)) {
+            fail("mount from=" + from + " to=" + to);
         }
     }
 
-    mounted_overlay(const mounted_overlay &src) = delete;
+    mount_bind(const mount_bind &src) = delete;
 
-    virtual ~mounted_overlay() {
-        if (umount(dir.c_str())) {
-            fprintf(stderr, "failed to unmount %s\n", dir.c_str());
+    virtual ~mount_bind() {
+        if (umount(to.c_str())) {
+            fprintf(stderr, "failed to unmount %s\n", to.c_str());
         }
     }
 };
@@ -465,14 +453,6 @@ int run_command(unplug_config &cfg, cpu_cgroup &tracked_cgroup) {
     return await_command(pid, tracked_cgroup);
 }
 
-mounted_overlay* create_overlay(workspace &ws, const string &dir) {
-    string overlay_dir = join_path(join_path(ws.root, dir), "/overlay");
-    exec({"mkdir", "-p", overlay_dir});
-    string work_dir = join_path(join_path(ws.root, dir), "/work");
-    exec({"mkdir", "-p", work_dir});
-    return new mounted_overlay(dir, overlay_dir, work_dir);
-}
-
 int run_container(unplug_config &cfg, workspace &ws) {
     if (signals_drain())
         return 1;
@@ -514,9 +494,10 @@ int run_container(unplug_config &cfg, workspace &ws) {
             int exit_code;
             /* scope for destructors */ {
                 cpu_cgroup tracked_cgroup(parent_pid);
-                vector<shared_ptr<mounted_overlay>> mounts;
-                for (const string &dir : cfg.isolated_dirs) {
-                    mounts.push_back(shared_ptr<mounted_overlay>(create_overlay(ws, dir)));
+                vector<shared_ptr<mount_bind>> binds;
+                for (const string &isolated : cfg.isolated_dirs) {
+                    string layer_dir = ws.root + isolated;
+                    binds.push_back(shared_ptr<mount_bind>(new mount_bind(layer_dir, isolated)));
                 }
                 int wstatus = run_command(cfg, tracked_cgroup);
                 exit_code = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : 1;
@@ -531,6 +512,17 @@ int run_container(unplug_config &cfg, workspace &ws) {
     }
 
     return await_child_interruptibly(pid);
+}
+
+void clone_isolated(workspace &ws, vector<string> &sources) {
+    for (string &source : sources) {
+        string target = ws.root + source;
+        string target_parent = target.substr(0, target.find_last_of('/'));
+
+        printf("cloning %s -> %s\n", source.c_str(), ws.root.c_str());
+        exec({"mkdir", "-p", target_parent});
+        exec_interruptibly({"cp", "-a", source, target_parent});
+    }
 }
 
 void verify_dirs(const vector<string> &dirs) {
@@ -585,6 +577,8 @@ int main(int argc, char **argv) {
         enable_ip_forward();
 
         workspace ws(cfg);
+        clone_isolated(ws, cfg.isolated_dirs);
+
         int wstatus = run_container(cfg, ws);
 
         printf("unplug done\n");
