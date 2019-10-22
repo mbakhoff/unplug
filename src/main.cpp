@@ -37,11 +37,18 @@ struct unplug_config {
     vector<uint32_t> port_forwards;
     vector<string> isolated_dirs;
     vector<string> cmd;
+    uint32_t subnet;
 
     unplug_config(int argc, char **argv) {
+        bool has_subnet = false;
         int i = 1;
         while (i < argc) {
-            if (strstr(argv[i], "-u") == argv[i]) {
+            if (strstr(argv[i], "-s") == argv[i]) {
+                subnet = string_to_ip(argv[i + 1]);
+                has_subnet = true;
+                i += 2;
+            }
+            else if (strstr(argv[i], "-u") == argv[i]) {
                 runas = argv[i + 1];
                 i += 2;
             }
@@ -78,6 +85,9 @@ struct unplug_config {
                 break;
             }
         }
+
+        if (!has_subnet)
+            subnet = string_to_ip("10.0.0.0");
 
         while (i < argc) {
             cmd.emplace_back(argv[i++]);
@@ -233,18 +243,17 @@ struct veth_pair {
     }
 
     string host_ip() const {
-      uint32_t host_raw = (10) | ((host_pid % UINT16_MAX) << 8) | (1 << 24);
+      uint32_t host_raw = cfg.subnet | (1 << 24);
       return ip_to_string(host_raw);
     }
 
     string container_ip() const {
-      uint32_t container_raw = (10) | ((host_pid % UINT16_MAX) << 8) | (2 << 24);
+      uint32_t container_raw = cfg.subnet | (2 << 24);
       return ip_to_string(container_raw);
     }
 
     string subnet() const {
-      uint32_t subnet_raw = (10) | ((host_pid % UINT16_MAX) << 8);
-      return ip_to_string(subnet_raw);
+      return ip_to_string(cfg.subnet);
     }
 
     void configure_host() {
@@ -287,7 +296,7 @@ struct veth_pair {
     void setup_port_forwarding() {
         if (cfg.port_forwards.empty())
             return;
-        string host_ip = ip_to_string(((10) | ((host_pid % UINT16_MAX) << 8) | (1 << 24)));
+        string host_ip = ip_to_string((cfg.subnet | (1 << 24)));
         file_write("/proc/sys/net/ipv4/conf/all/route_localnet", "1");
         exec({"iptables", "-w", "10", "-t", "nat", "-A", "POSTROUTING", "-j", "MASQUERADE"});
         for (uint32_t port : cfg.port_forwards) {
@@ -296,7 +305,6 @@ struct veth_pair {
     }
 
     virtual ~veth_pair() {
-        uint32_t subnet_raw = (10) | ((host_pid % UINT16_MAX) << 8);
         try {
             exec({"iptables", "-w", "10", "-D", "FORWARD", "-i", ifname_host, "-j", "ACCEPT"});
             exec({"iptables", "-w", "10", "-D", "FORWARD", "-o", ifname_host, "-j", "ACCEPT"});
@@ -304,7 +312,7 @@ struct veth_pair {
             perror(e.what());
         }
         try {
-            exec({"iptables", "-w", "10", "-t", "nat", "-D", "POSTROUTING", "-s", ip_to_string(subnet_raw) + "/30", "-j", "MASQUERADE"});
+            exec({"iptables", "-w", "10", "-t", "nat", "-D", "POSTROUTING", "-s", ip_to_string(cfg.subnet) + "/30", "-j", "MASQUERADE"});
         } catch (const exception &e) {
             perror(e.what());
         }
@@ -544,6 +552,7 @@ void verify_dirs(const vector<string> &dirs) {
 void usage() {
     printf("usage: unplug [options] <command ...>\n");
     printf("options:\n");
+    printf("  -s subnet  - subnet without mask, /24. default: 10.0.0.0 \n");
     printf("  -u <user>  - run command as user\n");
     printf("  -p <path>  - write unplug pid to file\n");
     printf("  -w <path>  - absolute path of the workspace\n");

@@ -44,6 +44,7 @@ bool is_link(const string &path);
 bool starts_with(const string &a, const string &b);
 vector<string> split(const string &s, char separator);
 string ip_to_string(uint32_t ip);
+uint32_t string_to_ip(const string &ip_s);
 vector<string> ancestors(const string &path);
 
 #endif

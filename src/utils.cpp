@@ -252,6 +252,13 @@ string ip_to_string(uint32_t ip) {
     return inet_ntoa(addr);
 }
 
+uint32_t string_to_ip(const string &ip_s) {
+    in_addr addr;
+    if (inet_pton(AF_INET, ip_s.c_str(), &addr) != 1)
+        fail("string_to_ip " + ip_s);
+    return addr.s_addr;
+}
+
 vector<string> ancestors(const string &path) {
     vector<string> result;
     size_t offset = 1;
